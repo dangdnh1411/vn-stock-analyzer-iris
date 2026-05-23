@@ -638,8 +638,6 @@ with tab2:
         cr  = grat('current_ratio')
         gm  = pct(grat('gross_margin'))
         nm  = pct(grat('net_margin'))
-        def pct(v): return v*100 if v and abs(v)<2 else v
-        roe=pct(roe); roa=pct(roa)
         f1,f2,f3,f4,f5,f6,f7=st.columns(7)
         f1.markdown(metric_html("P/E",f"{pe:.1f}x" if pe else "—","#00d97e" if pe and 0<pe<20 else "#ff3d5a" if pe else "#8baed4"),unsafe_allow_html=True)
         f2.markdown(metric_html("P/B",f"{pb:.2f}x" if pb else "—","#00d97e" if pb and 0<pb<4 else "#ff3d5a" if pb else "#8baed4"),unsafe_allow_html=True)
@@ -710,83 +708,59 @@ with tab3:
     vol_trend["Close"]=vol_trend["Close"].apply(lambda x:f"{x:,.0f}")
     vol_trend=vol_trend.rename(columns={"Date":"Ngày","Volume":"Khối lượng","Close":"Giá đóng cửa","Vol_Ratio":"Vol/TB"})
     st.dataframe(vol_trend.tail(15).reset_index(drop=True),use_container_width=True,hide_index=True)
-  # Thêm hàm phân tích bơm/xả — đặt cùng với các hàm khác
-def analyze_pump_dump(df):
-    """Phát hiện dấu hiệu bơm/xả từ price-volume action."""
-    signals = []
-    d = df.tail(20).copy()
-    
-    # 1. Bơm: Giá tăng mạnh + Vol đột biến
-    pump = d[(d["Vol_Ratio"] > 2.0) & (d["Close"] > d["Open"]) & 
-             (d["Close"].pct_change() > 0.03)]
+
+    # === Phân tích bơm/xả ===
+    st.markdown("### 🔍 Phân tích dấu hiệu bơm/xả")
+    d20 = df.tail(20).copy()
+
+    pump = d20[(d20["Vol_Ratio"] > 2.0) & (d20["Close"] > d20["Open"]) &
+               (d20["Close"].pct_change() > 0.03)]
+    dump = d20[(d20["Vol_Ratio"] > 2.0) & (d20["Close"] < d20["Open"]) &
+               (d20["Close"].pct_change() < -0.03)]
+    last5 = d20.tail(5)
+    price_up = last5["Close"].iloc[-1] > last5["Close"].iloc[0]
+    vol_down = last5["Volume"].iloc[-1] < last5["Volume"].iloc[0]
+
     if len(pump) > 0:
-        signals.append(("🚨 DẤU HIỆU BƠM", "warning",
-            f"{len(pump)} phiên gần đây: giá tăng >3% kèm khối lượng đột biến >2x. "
-            "Cẩn thận bẫy thanh khoản — bơm để xả."))
-    
-    # 2. Xả: Giá giảm + Vol đột biến 
-    dump = d[(d["Vol_Ratio"] > 2.0) & (d["Close"] < d["Open"]) &
-             (d["Close"].pct_change() < -0.03)]
+        st.warning(f"**🚨 DẤU HIỆU BƠM** — {len(pump)} phiên gần đây: giá tăng >3% kèm KL đột biến >2x. Cẩn thận bẫy thanh khoản.")
     if len(dump) > 0:
-        signals.append(("🔴 DẤU HIỆU XẢ HÀNG", "error",
-            f"{len(dump)} phiên: giá giảm >3% kèm khối lượng lớn. "
-            "Áp lực bán mạnh từ tay to."))
-    
-    # 3. Phân kỳ âm: giá tăng nhưng vol giảm dần
-    last5  = d.tail(5)
-    price_up  = last5["Close"].iloc[-1] > last5["Close"].iloc[0]
-    vol_down  = last5["Volume"].iloc[-1] < last5["Volume"].iloc[0]
+        st.error(f"**🔴 DẤU HIỆU XẢ HÀNG** — {len(dump)} phiên: giá giảm >3% kèm KL lớn. Áp lực bán mạnh từ tay to.")
     if price_up and vol_down:
-        signals.append(("⚠️ PHÂN KỲ VOLUME", "warning",
-            "Giá tăng nhưng khối lượng suy giảm 5 phiên gần nhất. "
-            "Xu hướng tăng thiếu động lực — rủi ro đảo chiều."))
-    
-    # 4. Khối lượng cạn kiệt: Vol < 0.3x TB
+        st.warning("**⚠️ PHÂN KỲ VOLUME** — Giá tăng nhưng KL giảm dần 5 phiên gần nhất. Thiếu động lực — rủi ro đảo chiều.")
     if df["Vol_Ratio"].tail(3).mean() < 0.3:
-        signals.append(("😴 THANH KHOẢN CẠN", "info",
-            "Khối lượng 3 phiên liên tiếp dưới 30% trung bình. "
-            "Thị trường mất quan tâm — không nên giao dịch."))
-    
-    # 5. Bình thường
-    if not signals:
-        signals.append(("✅ BÌNH THƯỜNG", "success",
-            "Không phát hiện dấu hiệu bất thường về khối lượng."))
-    return signals
-# Trong Tab 3, sau biểu đồ, thêm:
-signals = analyze_pump_dump(df)
-st.markdown("### 🔍 Phân tích dấu hiệu bơm/xả")
-for title, level, desc in signals:
-    if level == "warning": st.warning(f"**{title}** — {desc}")
-    elif level == "error":  st.error(f"**{title}** — {desc}")
-    elif level == "success":st.success(f"**{title}** — {desc}")
-    else:                   st.info(f"**{title}** — {desc}")
-      # Chart 2 panel: giá trên, vol/TB dưới — cùng trục X để thấy divergence rõ
-fig_pv = make_subplots(rows=2, cols=1, shared_xaxes=True,
-    vertical_spacing=0.04, row_heights=[0.6, 0.4],
-    subplot_titles=("Giá đóng cửa", "Vol/TB (đường 1x = bình thường)"))
+        st.info("**😴 THANH KHOẢN CẠN** — KL 3 phiên liên tiếp dưới 30% TB. Không nên giao dịch.")
+    if len(pump) == 0 and len(dump) == 0 and not (price_up and vol_down):
+        st.success("**✅ BÌNH THƯỜNG** — Không phát hiện dấu hiệu bất thường về khối lượng.")
 
-show_pv = df.tail(60)
-fig_pv.add_trace(go.Scatter(x=show_pv["Date"], y=show_pv["Close"],
-    line=dict(color="#4a9ef8", width=1.8), name="Giá"), row=1, col=1)
-fig_pv.add_trace(go.Bar(x=show_pv["Date"], y=show_pv["Vol_Ratio"],
-    marker_color=["#00d97e" if r.Close>=r.Open else "#ff3d5a" 
-                  for _,r in show_pv.iterrows()], name="Vol/TB"), row=2, col=1)
-fig_pv.add_hline(y=1.5, row=2, col=1,
-    line=dict(color="#f5a623", dash="dot", width=1),
-    annotation_text=" Ngưỡng đột biến 1.5x")
-fig_pv.add_hline(y=1.0, row=2, col=1,
-    line=dict(color="rgba(255,255,255,0.2)", dash="dot", width=0.8))
-# Cuối Tab 3, thêm bảng 3 cột nhận định:
-col_a, col_b, col_c = st.columns(3)
+    # Chart Price vs Volume Ratio
+    show_pv = df.tail(60).copy()
+    fig_pv = make_subplots(rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.04, row_heights=[0.6, 0.4],
+        subplot_titles=("Giá đóng cửa (60 phiên)", "Vol/TB — ngưỡng 1.5x = đột biến"))
+    fig_pv.add_trace(go.Scatter(x=show_pv["Date"], y=show_pv["Close"],
+        line=dict(color="#4a9ef8", width=1.8), name="Giá"), row=1, col=1)
+    pv_colors = ["#00d97e" if r.Close >= r.Open else "#ff3d5a" for _, r in show_pv.iterrows()]
+    fig_pv.add_trace(go.Bar(x=show_pv["Date"], y=show_pv["Vol_Ratio"],
+        marker_color=pv_colors, name="Vol/TB"), row=2, col=1)
+    fig_pv.add_hline(y=1.5, row=2, col=1,
+        line=dict(color="#f5a623", dash="dot", width=1),
+        annotation_text=" Ngưỡng đột biến 1.5x", annotation_font=dict(color="#f5a623", size=9))
+    fig_pv.add_hline(y=1.0, row=2, col=1,
+        line=dict(color="rgba(200,200,200,0.25)", dash="dot", width=0.8))
+    fig_pv.update_layout(height=400, template="plotly_dark", **CHART_STYLE)
+    for ann in fig_pv.layout.annotations:
+        ann.font.color = "#8baed4"; ann.font.size = 10
+    st.plotly_chart(fig_pv, use_container_width=True)
 
-# Tính các chỉ số
-avg_vol_up   = df[df["Close"]>=df["Open"]]["Vol_Ratio"].tail(20).mean()
-avg_vol_down = df[df["Close"]<df["Open"]]["Vol_Ratio"].tail(20).mean()
-trend_vol    = "Mua chiếm ưu thế 🟢" if avg_vol_up > avg_vol_down else "Bán chiếm ưu thế 🔴"
-
-col_a.metric("Vol trung bình ngày tăng", f"×{avg_vol_up:.2f}", "so TB 20 phiên")
-col_b.metric("Vol trung bình ngày giảm", f"×{avg_vol_down:.2f}", "so TB 20 phiên")  
-col_c.metric("Nhận định dòng tiền", trend_vol)
+    # Nhận định dòng tiền tổng hợp
+    st.markdown("### 📊 Nhận định dòng tiền")
+    avg_vol_up   = df[df["Close"] >= df["Open"]]["Vol_Ratio"].tail(20).mean()
+    avg_vol_down = df[df["Close"] <  df["Open"]]["Vol_Ratio"].tail(20).mean()
+    trend_vol = "Mua chiếm ưu thế 🟢" if avg_vol_up > avg_vol_down else "Bán chiếm ưu thế 🔴"
+    ca1, ca2, ca3 = st.columns(3)
+    ca1.metric("Vol TB ngày tăng giá", f"×{avg_vol_up:.2f}", "so TB 20 phiên")
+    ca2.metric("Vol TB ngày giảm giá", f"×{avg_vol_down:.2f}", "so TB 20 phiên")
+    ca3.metric("Nhận định dòng tiền", trend_vol)
 
 # ── TAB 4: TỔNG HỢP ────────────────────────────────────────────────────────
 with tab4:
