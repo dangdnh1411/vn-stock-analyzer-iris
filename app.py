@@ -12,7 +12,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
-import math, time
+import math, time, re
 
 st.set_page_config(layout="wide", page_title="Pro Trader Terminal", page_icon="📈",
                    initial_sidebar_state="expanded")
@@ -100,110 +100,21 @@ def fetch_price(sym: str, days: int, interval: str):
         except Exception as e2:
             raise RuntimeError(f"KBS: {e1} | Yahoo: {e2}")
 
-def _parse_best_json(text: str) -> dict:
-    """Tìm JSON object đầy đủ nhất trong text."""
-    candidates = []
-    depth = 0; start = -1
-    for i, ch in enumerate(text):
-        if ch == '{':
-            if depth == 0: start = i
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0 and start >= 0:
-                candidates.append(text[start:i+1])
-    candidates.sort(key=len, reverse=True)
-    for c in candidates:
-        try:
-            data = json.loads(c)
-            if isinstance(data, dict) and any(k in data for k in ['pe','roe','pb','eps','roa']):
-                return data
-        except: pass
-    return {}
-
-def _claude_data_to_ratdf(data: dict) -> pd.DataFrame:
-    """Chuyển JSON từ Claude thành rat_df long-format."""
-    if not data: return pd.DataFrame()
-    years_data = data.get('years', {})
-    if not years_data:
-        yr = str(data.get('year', datetime.now().year))
-        years_data = {yr: data}
-    field_map = [
-        ('pe',  'pe_ratio',           'P/E'),
-        ('pb',  'pb_ratio',           'P/B'),
-        ('roe', 'roe',                'ROE'),
-        ('roa', 'roa',                'ROA'),
-        ('eps', 'earnings_per_share', 'EPS'),
-        ('de',  'debt_to_equity',     'Debt/Equity'),
-        ('cr',  'current_ratio',      'Current Ratio'),
-        ('gm',  'gross_margin',       'Gross Margin%'),
-        ('nm',  'net_margin',         'Net Margin%'),
-    ]
-    year_list = sorted(years_data.keys())
-    rows = []
-    for short_key, item_id, item_name in field_map:
-        row = {'item': item_name, 'item_id': item_id}
-        for yr in year_list:
-            row[yr] = years_data[yr].get(short_key)
-        rows.append(row)
-    df = pd.DataFrame(rows)
-    df.attrs['periods'] = year_list
-    df.attrs['source'] = 'Claude AI + Web Search'
-    return df
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ratio(sym: str):
-    """Lấy chỉ số tài chính: KBS → Claude AI fallback."""
-    import json as _json
-    # === Tầng 1: KBS ===
+    """Lấy chỉ số tài chính từ KBS."""
     try:
         from vnstock import Finance
         fin = Finance(symbol=sym.upper(), source="KBS")
         df  = fin.ratio(period="year")
-        if df is not None and not df.empty:
-            return df, "KBS Finance ✅"
-    except Exception as e_kbs:
-        pass
-    # === Tầng 2: Claude API + web_search ===
-    try:
-        prompt = (
-            f"Search for {sym} stock (Vietnam HOSE) latest financial ratios. "
-            f"Find P/E, P/B, ROE%, ROA%, EPS (VND), Debt/Equity, Current Ratio, "
-            f"Gross Margin%, Net Margin% for years 2021-2024. "
-            f"Return ONLY this JSON (no explanation):\n"
-            f'{{"pe":8.5,"pb":1.2,"roe":17.2,"roa":1.8,"eps":3250,"de":9.2,"cr":1.1,"gm":72.0,"nm":24.0,"year":2024,'
-            f'"years":{{"2021":{{"pe":12.5,"pb":2.3,"roe":19.5,"roa":2.0,"eps":2100}},'
-            f'"2022":{{"pe":9.1,"pb":1.8,"roe":20.1,"roa":2.1,"eps":2620}},'
-            f'"2023":{{"pe":7.2,"pb":1.1,"roe":15.5,"roa":1.6,"eps":2750}},'
-            f'"2024":{{"pe":8.5,"pb":1.2,"roe":17.2,"roa":1.8,"eps":3250}}}}}}'
-        )
-        import urllib.request
-        req_data = _json.dumps({
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1500,
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-            "messages": [{"role": "user", "content": prompt}]
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=req_data,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = _json.loads(resp.read())
-        text = " ".join(
-            c.get("text","") for c in result.get("content",[])
-            if c.get("type") == "text"
-        )
-        data = _parse_best_json(text)
-        if data:
-            df = _claude_data_to_ratdf(data)
-            if not df.empty:
-                return df, "Claude AI + Web Search ✅"
-    except Exception as e_claude:
-        pass
-    return pd.DataFrame(), "Không lấy được dữ liệu tài chính"
+        if df is None or df.empty: raise ValueError("Empty ratio")
+        # Sort mới nhất lên đầu
+        year_col = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
+        if year_col:
+            df = df.sort_values(year_col, ascending=False).reset_index(drop=True)
+        return df, "KBS Finance ✅"
+    except Exception as e:
+        return pd.DataFrame(), f"Lỗi: {e}"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_income(sym: str) -> pd.DataFrame:
@@ -385,26 +296,14 @@ def score_fundamental(rat_df: pd.DataFrame):
     # Đọc đúng từ LONG format
     year_cols = sorted([c for c in rat_df.columns
                         if c not in ['item','item_id','item_en','unit','levels','row_number']
-                        and str(c).isdigit()])
+                        and bool(re.search(r'\d{4}', str(c)))])
     latest_yr = year_cols[-1] if year_cols else None
 
-    SCORE_ALIASES = {
-        'pe_ratio':          ['pe_ratio','p_e'],
-        'pb_ratio':          ['pb_ratio','p_b'],
-        'roe':               ['roe'],
-        'roa':               ['roa'],
-        'earnings_per_share':['earnings_per_share','eps'],
-        'debt_to_equity':    ['debt_to_equity','debt_equity'],
-        'current_ratio':     ['current_ratio'],
-    }
     def gv(item_id):
-        if latest_yr is None: return None
-        for alias in SCORE_ALIASES.get(item_id, [item_id]):
-            row = rat_df[rat_df['item_id'] == alias]
-            if not row.empty:
-                v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
-                return float(v) if pd.notna(v) else None
-        return None
+        row = rat_df[rat_df['item_id'] == item_id]
+        if row.empty or latest_yr is None: return None
+        v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+        return float(v) if pd.notna(v) else None
 
     def pct(v): return v*100 if v and abs(v)<2 else v
 
@@ -483,27 +382,16 @@ def build_fin_charts(rat_df, inc_df):
     # Xác định cột năm
     year_cols = sorted([c for c in rat_df.columns
                         if c not in ['item','item_id','item_en','unit','levels','row_number']
-                        and str(c).isdigit()])
+                        and bool(re.search(r'\d{4}', str(c)))])
     if not year_cols: return charts
     x = year_cols  # ['2021','2022','2023','2024']
 
-    CHART_ALIASES = {
-        'pe_ratio':          ['pe_ratio','p_e'],
-        'pb_ratio':          ['pb_ratio','p_b'],
-        'roe':               ['roe'],
-        'roa':               ['roa'],
-        'earnings_per_share':['earnings_per_share','eps'],
-        'debt_to_equity':    ['debt_to_equity','debt_equity'],
-        'gross_margin':      ['gross_margin','gross_profit_margin'],
-        'net_margin':        ['net_margin','net_profit_margin'],
-    }
     def get_series(item_id):
-        """Lấy chuỗi giá trị theo năm — tìm theo aliases."""
-        for alias in CHART_ALIASES.get(item_id, [item_id]):
-            row = rat_df[rat_df['item_id'] == alias]
-            if not row.empty:
-                return pd.to_numeric(row[year_cols].values[0], errors='coerce')
-        return None
+        """Lấy chuỗi giá trị theo năm cho 1 chỉ số."""
+        row = rat_df[rat_df['item_id'] == item_id]
+        if row.empty: return None
+        vals = pd.to_numeric(row[year_cols].values[0], errors='coerce')
+        return vals
 
     eps_s = get_series('earnings_per_share')
     roe_s = get_series('roe')
@@ -726,40 +614,18 @@ with tab1:
 with tab2:
     if not rat_df.empty:
         st.markdown("### 📊 Chỉ số tài chính (kỳ mới nhất)")
-        # DEBUG: Hiển thị raw data để debug
-        with st.expander("🔧 Debug — Raw data từ KBS/Claude (click để xem)", expanded=False):
-            st.write(f"**Nguồn:** {ratio_src}")
-            st.write(f"**Shape:** {rat_df.shape}")
-            st.write(f"**Columns:** {list(rat_df.columns)}")
-            st.write(f"**attrs:** {rat_df.attrs}")
-            st.dataframe(rat_df, use_container_width=True)
         # Xác định cột năm (2021, 2022, 2023, 2024...)
         year_cols = sorted([c for c in rat_df.columns
                             if c not in ['item','item_id','item_en','unit','levels','row_number']
-                            and str(c).isdigit()])
+                            and bool(re.search(r'\d{4}', str(c)))])
         latest_yr = year_cols[-1] if year_cols else None
 
-        # Map aliases: KBS có thể trả item_id khác tùy NameEn
-        ALIASES = {
-            'pe_ratio':          ['pe_ratio','p_e'],
-            'pb_ratio':          ['pb_ratio','p_b'],
-            'roe':               ['roe'],
-            'roa':               ['roa'],
-            'earnings_per_share':['earnings_per_share','eps'],
-            'debt_to_equity':    ['debt_to_equity','debt_equity'],
-            'current_ratio':     ['current_ratio'],
-            'gross_margin':      ['gross_margin','gross_profit_margin'],
-            'net_margin':        ['net_margin','net_profit_margin'],
-        }
         def grat(item_id):
-            """Lấy giá trị mới nhất — tìm theo aliases."""
-            if latest_yr is None: return None
-            for alias in ALIASES.get(item_id, [item_id]):
-                row = rat_df[rat_df['item_id'] == alias]
-                if not row.empty:
-                    v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
-                    return float(v) if pd.notna(v) else None
-            return None
+            """Lấy giá trị mới nhất của chỉ số từ long format."""
+            row = rat_df[rat_df['item_id'] == item_id]
+            if row.empty or latest_yr is None: return None
+            v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+            return float(v) if pd.notna(v) else None
 
         def pct(v): return v*100 if v and abs(v) < 2 else v
 
@@ -772,6 +638,8 @@ with tab2:
         cr  = grat('current_ratio')
         gm  = pct(grat('gross_margin'))
         nm  = pct(grat('net_margin'))
+        def pct(v): return v*100 if v and abs(v)<2 else v
+        roe=pct(roe); roa=pct(roa)
         f1,f2,f3,f4,f5,f6,f7=st.columns(7)
         f1.markdown(metric_html("P/E",f"{pe:.1f}x" if pe else "—","#00d97e" if pe and 0<pe<20 else "#ff3d5a" if pe else "#8baed4"),unsafe_allow_html=True)
         f2.markdown(metric_html("P/B",f"{pb:.2f}x" if pb else "—","#00d97e" if pb and 0<pb<4 else "#ff3d5a" if pb else "#8baed4"),unsafe_allow_html=True)
@@ -783,7 +651,7 @@ with tab2:
         for fig_f in build_fin_charts(rat_df,inc_df):
             st.plotly_chart(fig_f,use_container_width=True)
         items_f,total_f=score_fundamental(rat_df)
-        eps_row = rat_df[rat_df['item_id'].isin(['earnings_per_share','eps'])]
+        eps_row = rat_df[rat_df['item_id'] == 'earnings_per_share']
         if not eps_row.empty and year_cols:
             eps_vals = pd.to_numeric(eps_row[year_cols].values[0], errors='coerce')
             growth_df = pd.DataFrame({'Năm': year_cols, 'EPS (đ)': eps_vals})
@@ -842,59 +710,83 @@ with tab3:
     vol_trend["Close"]=vol_trend["Close"].apply(lambda x:f"{x:,.0f}")
     vol_trend=vol_trend.rename(columns={"Date":"Ngày","Volume":"Khối lượng","Close":"Giá đóng cửa","Vol_Ratio":"Vol/TB"})
     st.dataframe(vol_trend.tail(15).reset_index(drop=True),use_container_width=True,hide_index=True)
-
-    # === Phân tích bơm/xả ===
-    st.markdown("### 🔍 Phân tích dấu hiệu bơm/xả")
-    d20 = df.tail(20).copy()
-
-    pump = d20[(d20["Vol_Ratio"] > 2.0) & (d20["Close"] > d20["Open"]) &
-               (d20["Close"].pct_change() > 0.03)]
-    dump = d20[(d20["Vol_Ratio"] > 2.0) & (d20["Close"] < d20["Open"]) &
-               (d20["Close"].pct_change() < -0.03)]
-    last5 = d20.tail(5)
-    price_up = last5["Close"].iloc[-1] > last5["Close"].iloc[0]
-    vol_down = last5["Volume"].iloc[-1] < last5["Volume"].iloc[0]
-
+  # Thêm hàm phân tích bơm/xả — đặt cùng với các hàm khác
+def analyze_pump_dump(df):
+    """Phát hiện dấu hiệu bơm/xả từ price-volume action."""
+    signals = []
+    d = df.tail(20).copy()
+    
+    # 1. Bơm: Giá tăng mạnh + Vol đột biến
+    pump = d[(d["Vol_Ratio"] > 2.0) & (d["Close"] > d["Open"]) & 
+             (d["Close"].pct_change() > 0.03)]
     if len(pump) > 0:
-        st.warning(f"**🚨 DẤU HIỆU BƠM** — {len(pump)} phiên gần đây: giá tăng >3% kèm KL đột biến >2x. Cẩn thận bẫy thanh khoản.")
+        signals.append(("🚨 DẤU HIỆU BƠM", "warning",
+            f"{len(pump)} phiên gần đây: giá tăng >3% kèm khối lượng đột biến >2x. "
+            "Cẩn thận bẫy thanh khoản — bơm để xả."))
+    
+    # 2. Xả: Giá giảm + Vol đột biến 
+    dump = d[(d["Vol_Ratio"] > 2.0) & (d["Close"] < d["Open"]) &
+             (d["Close"].pct_change() < -0.03)]
     if len(dump) > 0:
-        st.error(f"**🔴 DẤU HIỆU XẢ HÀNG** — {len(dump)} phiên: giá giảm >3% kèm KL lớn. Áp lực bán mạnh từ tay to.")
+        signals.append(("🔴 DẤU HIỆU XẢ HÀNG", "error",
+            f"{len(dump)} phiên: giá giảm >3% kèm khối lượng lớn. "
+            "Áp lực bán mạnh từ tay to."))
+    
+    # 3. Phân kỳ âm: giá tăng nhưng vol giảm dần
+    last5  = d.tail(5)
+    price_up  = last5["Close"].iloc[-1] > last5["Close"].iloc[0]
+    vol_down  = last5["Volume"].iloc[-1] < last5["Volume"].iloc[0]
     if price_up and vol_down:
-        st.warning("**⚠️ PHÂN KỲ VOLUME** — Giá tăng nhưng KL giảm dần 5 phiên gần nhất. Thiếu động lực — rủi ro đảo chiều.")
+        signals.append(("⚠️ PHÂN KỲ VOLUME", "warning",
+            "Giá tăng nhưng khối lượng suy giảm 5 phiên gần nhất. "
+            "Xu hướng tăng thiếu động lực — rủi ro đảo chiều."))
+    
+    # 4. Khối lượng cạn kiệt: Vol < 0.3x TB
     if df["Vol_Ratio"].tail(3).mean() < 0.3:
-        st.info("**😴 THANH KHOẢN CẠN** — KL 3 phiên liên tiếp dưới 30% TB. Không nên giao dịch.")
-    if len(pump) == 0 and len(dump) == 0 and not (price_up and vol_down):
-        st.success("**✅ BÌNH THƯỜNG** — Không phát hiện dấu hiệu bất thường về khối lượng.")
+        signals.append(("😴 THANH KHOẢN CẠN", "info",
+            "Khối lượng 3 phiên liên tiếp dưới 30% trung bình. "
+            "Thị trường mất quan tâm — không nên giao dịch."))
+    
+    # 5. Bình thường
+    if not signals:
+        signals.append(("✅ BÌNH THƯỜNG", "success",
+            "Không phát hiện dấu hiệu bất thường về khối lượng."))
+    return signals
+# Trong Tab 3, sau biểu đồ, thêm:
+signals = analyze_pump_dump(df)
+st.markdown("### 🔍 Phân tích dấu hiệu bơm/xả")
+for title, level, desc in signals:
+    if level == "warning": st.warning(f"**{title}** — {desc}")
+    elif level == "error":  st.error(f"**{title}** — {desc}")
+    elif level == "success":st.success(f"**{title}** — {desc}")
+    else:                   st.info(f"**{title}** — {desc}")
+      # Chart 2 panel: giá trên, vol/TB dưới — cùng trục X để thấy divergence rõ
+fig_pv = make_subplots(rows=2, cols=1, shared_xaxes=True,
+    vertical_spacing=0.04, row_heights=[0.6, 0.4],
+    subplot_titles=("Giá đóng cửa", "Vol/TB (đường 1x = bình thường)"))
 
-    # Chart Price vs Volume Ratio
-    show_pv = df.tail(60).copy()
-    fig_pv = make_subplots(rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.04, row_heights=[0.6, 0.4],
-        subplot_titles=("Giá đóng cửa (60 phiên)", "Vol/TB — ngưỡng 1.5x = đột biến"))
-    fig_pv.add_trace(go.Scatter(x=show_pv["Date"], y=show_pv["Close"],
-        line=dict(color="#4a9ef8", width=1.8), name="Giá"), row=1, col=1)
-    pv_colors = ["#00d97e" if r.Close >= r.Open else "#ff3d5a" for _, r in show_pv.iterrows()]
-    fig_pv.add_trace(go.Bar(x=show_pv["Date"], y=show_pv["Vol_Ratio"],
-        marker_color=pv_colors, name="Vol/TB"), row=2, col=1)
-    fig_pv.add_hline(y=1.5, row=2, col=1,
-        line=dict(color="#f5a623", dash="dot", width=1),
-        annotation_text=" Ngưỡng đột biến 1.5x", annotation_font=dict(color="#f5a623", size=9))
-    fig_pv.add_hline(y=1.0, row=2, col=1,
-        line=dict(color="rgba(200,200,200,0.25)", dash="dot", width=0.8))
-    fig_pv.update_layout(height=400, template="plotly_dark", **CHART_STYLE)
-    for ann in fig_pv.layout.annotations:
-        ann.font.color = "#8baed4"; ann.font.size = 10
-    st.plotly_chart(fig_pv, use_container_width=True)
+show_pv = df.tail(60)
+fig_pv.add_trace(go.Scatter(x=show_pv["Date"], y=show_pv["Close"],
+    line=dict(color="#4a9ef8", width=1.8), name="Giá"), row=1, col=1)
+fig_pv.add_trace(go.Bar(x=show_pv["Date"], y=show_pv["Vol_Ratio"],
+    marker_color=["#00d97e" if r.Close>=r.Open else "#ff3d5a" 
+                  for _,r in show_pv.iterrows()], name="Vol/TB"), row=2, col=1)
+fig_pv.add_hline(y=1.5, row=2, col=1,
+    line=dict(color="#f5a623", dash="dot", width=1),
+    annotation_text=" Ngưỡng đột biến 1.5x")
+fig_pv.add_hline(y=1.0, row=2, col=1,
+    line=dict(color="rgba(255,255,255,0.2)", dash="dot", width=0.8))
+# Cuối Tab 3, thêm bảng 3 cột nhận định:
+col_a, col_b, col_c = st.columns(3)
 
-    # Nhận định dòng tiền tổng hợp
-    st.markdown("### 📊 Nhận định dòng tiền")
-    avg_vol_up   = df[df["Close"] >= df["Open"]]["Vol_Ratio"].tail(20).mean()
-    avg_vol_down = df[df["Close"] <  df["Open"]]["Vol_Ratio"].tail(20).mean()
-    trend_vol = "Mua chiếm ưu thế 🟢" if avg_vol_up > avg_vol_down else "Bán chiếm ưu thế 🔴"
-    ca1, ca2, ca3 = st.columns(3)
-    ca1.metric("Vol TB ngày tăng giá", f"×{avg_vol_up:.2f}", "so TB 20 phiên")
-    ca2.metric("Vol TB ngày giảm giá", f"×{avg_vol_down:.2f}", "so TB 20 phiên")
-    ca3.metric("Nhận định dòng tiền", trend_vol)
+# Tính các chỉ số
+avg_vol_up   = df[df["Close"]>=df["Open"]]["Vol_Ratio"].tail(20).mean()
+avg_vol_down = df[df["Close"]<df["Open"]]["Vol_Ratio"].tail(20).mean()
+trend_vol    = "Mua chiếm ưu thế 🟢" if avg_vol_up > avg_vol_down else "Bán chiếm ưu thế 🔴"
+
+col_a.metric("Vol trung bình ngày tăng", f"×{avg_vol_up:.2f}", "so TB 20 phiên")
+col_b.metric("Vol trung bình ngày giảm", f"×{avg_vol_down:.2f}", "so TB 20 phiên")  
+col_c.metric("Nhận định dòng tiền", trend_vol)
 
 # ── TAB 4: TỔNG HỢP ────────────────────────────────────────────────────────
 with tab4:
