@@ -290,40 +290,44 @@ def calc_trade(df, score):
 
 # ══════════════════════════════ FUNDAMENTAL SCORING ════════════════════════════
 def score_fundamental(rat_df: pd.DataFrame):
-    """Chấm điểm cơ bản từ KBS ratio data."""
     items=[]; total=0.0
     if rat_df.empty: return items, total
-    r=rat_df.iloc[0]  # newest first
 
-    # KBS ratio columns (tiếng Việt hoặc English tùy lang setting)
-    pe  = _safe(r,"pe_ratio","P/E","priceToEarning","pe","Chỉ số P/E")
-    pb  = _safe(r,"pb_ratio","P/B","priceToBook","pb","Chỉ số P/B")
-    eps = _safe(r,"earnings_per_share","EPS","earningPerShare","Thu nhập mỗi cổ phiếu")
-    roe = _safe(r,"roe","ROE","Lợi nhuận trên vốn chủ sở hữu")
-    roa = _safe(r,"roa","ROA","Lợi nhuận trên tổng tài sản")
-    de  = _safe(r,"debt_to_equity","D/E","debtOnEquity","Tỷ lệ nợ trên vốn chủ sở hữu")
-    cr  = _safe(r,"current_ratio","Tỷ số thanh toán hiện hành")
+    # Đọc đúng từ LONG format
+    year_cols = sorted([c for c in rat_df.columns
+                        if c not in ['item','item_id','item_en','unit','levels','row_number']
+                        and str(c).isdigit()])
+    latest_yr = year_cols[-1] if year_cols else None
 
-    # KBS Finance trả về ROE/ROA dạng % trực tiếp (không phải decimal)
-    # Nếu giá trị < 2 có thể vẫn là decimal → convert
+    def gv(item_id):
+        row = rat_df[rat_df['item_id'] == item_id]
+        if row.empty or latest_yr is None: return None
+        v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+        return float(v) if pd.notna(v) else None
+
     def pct(v): return v*100 if v and abs(v)<2 else v
 
-    roe=pct(roe); roa=pct(roa)
+    roe = pct(gv('roe'))
+    roa = pct(gv('roa'))
+    pe  = gv('pe_ratio')
+    pb  = gv('pb_ratio')
+    eps = gv('earnings_per_share')
+    de  = gv('debt_to_equity')
 
-    checks=[
-        ("ROE",  roe, lambda v:v>15,  "ROE >15% — sinh lời tốt","ROE <15% — thấp",1.0),
-        ("ROA",  roa, lambda v:v>1.5, "ROA >1.5% — tốt","ROA thấp",0.5),
-        ("P/E",  pe,  lambda v:0<v<20,"P/E hợp lý","P/E cao hoặc âm",1.0),
-        ("P/B",  pb,  lambda v:0<v<4, "P/B <4x","P/B cao",0.5),
-        ("EPS",  eps, lambda v:v>0,   "EPS dương — có lãi","EPS âm — lỗ",1.5),
-        ("D/E",  de,  lambda v:v<12,  "Đòn bẩy hợp lý","Đòn bẩy quá cao",0.3),
+    checks = [
+        ("ROE",  roe, lambda v:v>15,  "ROE >15% — sinh lời tốt", "ROE <15% — thấp", 1.0),
+        ("ROA",  roa, lambda v:v>1.5, "ROA >1.5%",               "ROA thấp",         0.5),
+        ("P/E",  pe,  lambda v:0<v<20,"P/E hợp lý (<20x)",       "P/E cao hoặc âm",  1.0),
+        ("P/B",  pb,  lambda v:0<v<4, "P/B <4x",                 "P/B cao",          0.5),
+        ("EPS",  eps, lambda v:v>0,   "EPS dương — có lãi",      "EPS âm — lỗ",     1.5),
+        ("D/E",  de,  lambda v:v<12,  "Đòn bẩy hợp lý",         "Đòn bẩy cao",     0.3),
     ]
     for lbl,val,fn,g_txt,b_txt,w in checks:
-        ok=fn(val) if val is not None else None
-        items.append(dict(label=lbl,val=val,ok=ok,good=g_txt,bad=b_txt))
-        if ok is True: total+=w
-        elif ok is False: total-=w
-    return items, round(total,1)
+        ok = fn(val) if val is not None else None
+        items.append(dict(label=lbl, val=val, ok=ok, good=g_txt, bad=b_txt))
+        if ok is True: total += w
+        elif ok is False: total -= w
+    return items, round(total, 1)
 
 # ══════════════════════════════ CHART BUILDERS ═════════════════════════════════
 def build_price_chart(df, trade, show_n, ema_list):
@@ -372,43 +376,76 @@ def build_price_chart(df, trade, show_n, ema_list):
     return fig
 
 def build_fin_charts(rat_df, inc_df):
-    charts=[]
+    charts = []
     if rat_df.empty: return charts
-    year_col=next((c for c in rat_df.columns if "year" in c.lower() or "năm" in c.lower()),None)
-    eps_col = next((c for c in rat_df.columns if c.lower() in ["earnings_per_share","eps"]), None)
-    roe_col = next((c for c in rat_df.columns if c.lower() == "roe"), None)
-    roa_col = next((c for c in rat_df.columns if c.lower() == "roa"), None)
-    rev_col  = next((c for c in inc_df.columns if c.lower() == "revenue"), None)
-    prof_col = next((c for c in inc_df.columns if c.lower() == "net_profit"), None)
-    gm_col = next((c for c in rat_df.columns if c.lower() == "gross_margin"), None)
-    nm_col = next((c for c in rat_df.columns if c.lower() == "net_margin"), None)
 
-    rdf=rat_df.sort_values(year_col,ascending=True).tail(8) if year_col else rat_df.tail(8)
-    x=rdf[year_col].astype(str) if year_col else list(range(len(rdf)))
+    # Xác định cột năm
+    year_cols = sorted([c for c in rat_df.columns
+                        if c not in ['item','item_id','item_en','unit','levels','row_number']
+                        and str(c).isdigit()])
+    if not year_cols: return charts
+    x = year_cols  # ['2021','2022','2023','2024']
 
-    fig=make_subplots(rows=1,cols=2,subplot_titles=("EPS theo năm","ROE & ROA xu hướng (%)"))
-    fig2 = make_subplots(rows=1, cols=2,subplot_titles=("Doanh thu & Lợi nhuận ròng", "Biên lợi nhuận (%)"))
-    if eps_col:
-        ev=pd.to_numeric(rdf[eps_col],errors="coerce")
-        bc=["#00d97e" if v>=0 else "#ff3d5a" for v in ev.fillna(0)]
-        fig.add_trace(go.Bar(x=x,y=ev,name="EPS",marker_color=bc,
-            text=ev.round(0),textposition="outside",textfont=dict(color="#cce0ff",size=10)),row=1,col=1)
-    if roe_col:
-        rv=pd.to_numeric(rdf[roe_col],errors="coerce")
-        rv=rv*100 if rv.dropna().abs().max()<2 else rv
-        fig.add_trace(go.Scatter(x=x,y=rv,name="ROE%",mode="lines+markers",
-            line=dict(color="#00d97e",width=2.5),marker=dict(size=7)),row=1,col=2)
-    if roa_col:
-        av=pd.to_numeric(rdf[roa_col],errors="coerce")
-        av=av*100 if av.dropna().abs().max()<2 else av
-        fig.add_trace(go.Scatter(x=x,y=av,name="ROA%",mode="lines+markers",
-            line=dict(color="#f5a623",width=2),marker=dict(size=6)),row=1,col=2)
-    for lvl,clr,lbl in[(15,"rgba(0,217,126,.4)","ROE 15%"),(1.5,"rgba(74,158,248,.35)","ROA 1.5%")]:
-        fig.add_hline(y=lvl,row=1,col=2,line=dict(color=clr,dash="dot",width=1),
-            annotation_text=f" {lbl}",annotation_font=dict(color=clr,size=9))
-    fig.update_layout(height=310,template="plotly_dark",**CHART_STYLE)
-    for ann in fig.layout.annotations: ann.font.color="#8baed4"; ann.font.size=11
-    charts.append(fig)
+    def get_series(item_id):
+        """Lấy chuỗi giá trị theo năm cho 1 chỉ số."""
+        row = rat_df[rat_df['item_id'] == item_id]
+        if row.empty: return None
+        vals = pd.to_numeric(row[year_cols].values[0], errors='coerce')
+        return vals
+
+    eps_s = get_series('earnings_per_share')
+    roe_s = get_series('roe')
+    roa_s = get_series('roa')
+    gm_s  = get_series('gross_margin')
+    nm_s  = get_series('net_margin')
+
+    # Convert decimal → percent cho ROE/ROA/margin
+    def to_pct(arr):
+        if arr is None: return None
+        import numpy as np
+        return arr * 100 if np.nanmax(np.abs(arr)) < 2 else arr
+
+    roe_s = to_pct(roe_s)
+    roa_s = to_pct(roa_s)
+    gm_s  = to_pct(gm_s)
+    nm_s  = to_pct(nm_s)
+
+    # Chart 1: EPS + ROE/ROA
+    fig1 = make_subplots(rows=1, cols=2,
+        subplot_titles=("EPS theo năm (đ/CP)", "ROE & ROA (%)"))
+    if eps_s is not None:
+        import numpy as np
+        bc = ["#00d97e" if v >= 0 else "#ff3d5a" for v in np.nan_to_num(eps_s)]
+        fig1.add_trace(go.Bar(x=x, y=eps_s, name="EPS", marker_color=bc,
+            text=[f"{v:,.0f}" for v in eps_s],
+            textposition="outside", textfont=dict(color="#cce0ff", size=10)), row=1, col=1)
+    if roe_s is not None:
+        fig1.add_trace(go.Scatter(x=x, y=roe_s, name="ROE%", mode="lines+markers",
+            line=dict(color="#00d97e", width=2.5), marker=dict(size=8)), row=1, col=2)
+    if roa_s is not None:
+        fig1.add_trace(go.Scatter(x=x, y=roa_s, name="ROA%", mode="lines+markers",
+            line=dict(color="#f5a623", width=2), marker=dict(size=7)), row=1, col=2)
+    for lvl, clr, lbl in [(15,"rgba(0,217,126,.4)","ROE 15%"),(1.5,"rgba(74,158,248,.35)","ROA 1.5%")]:
+        fig1.add_hline(y=lvl, row=1, col=2,
+            line=dict(color=clr, dash="dot", width=1),
+            annotation_text=f" {lbl}", annotation_font=dict(color=clr, size=9))
+    fig1.update_layout(height=310, template="plotly_dark", **CHART_STYLE)
+    for ann in fig1.layout.annotations: ann.font.color="#8baed4"; ann.font.size=11
+    charts.append(fig1)
+
+    # Chart 2: Biên lợi nhuận
+    if gm_s is not None or nm_s is not None:
+        fig2 = go.Figure()
+        if gm_s is not None:
+            fig2.add_trace(go.Scatter(x=x, y=gm_s, name="Biên gộp%", mode="lines+markers",
+                line=dict(color="#a78bfa", width=2), marker=dict(size=7)))
+        if nm_s is not None:
+            fig2.add_trace(go.Scatter(x=x, y=nm_s, name="Biên ròng%", mode="lines+markers",
+                line=dict(color="#22d3ee", width=2), marker=dict(size=7)))
+        fig2.update_layout(height=240, title="Biên lợi nhuận (%)",
+            template="plotly_dark", **CHART_STYLE)
+        fig2.layout.title.font.color="#8baed4"; fig2.layout.title.font.size=12
+        charts.append(fig2)
     return charts
 
 # ══════════════════════════════ UI COMPONENTS ══════════════════════════════════
@@ -577,14 +614,30 @@ with tab1:
 with tab2:
     if not rat_df.empty:
         st.markdown("### 📊 Chỉ số tài chính (kỳ mới nhất)")
-        r=rat_df.iloc[0]
-        eps = _safe(r, "earnings_per_share", "eps")
-        roe = _safe(r, "roe")
-        roa = _safe(r, "roa")
-        pe  = _safe(r, "pe_ratio")
-        pb  = _safe(r, "pb_ratio")
-        de  = _safe(r, "debt_to_equity")
-        cr  = _safe(r, "current_ratio")
+        # Xác định cột năm (2021, 2022, 2023, 2024...)
+        year_cols = sorted([c for c in rat_df.columns
+                            if c not in ['item','item_id','item_en','unit','levels','row_number']
+                            and str(c).isdigit()])
+        latest_yr = year_cols[-1] if year_cols else None
+
+        def grat(item_id):
+            """Lấy giá trị mới nhất của chỉ số từ long format."""
+            row = rat_df[rat_df['item_id'] == item_id]
+            if row.empty or latest_yr is None: return None
+            v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+            return float(v) if pd.notna(v) else None
+
+        def pct(v): return v*100 if v and abs(v) < 2 else v
+
+        pe  = grat('pe_ratio')
+        pb  = grat('pb_ratio')
+        eps = grat('earnings_per_share')
+        roe = pct(grat('roe'))
+        roa = pct(grat('roa'))
+        de  = grat('debt_to_equity')
+        cr  = grat('current_ratio')
+        gm  = pct(grat('gross_margin'))
+        nm  = pct(grat('net_margin'))
         def pct(v): return v*100 if v and abs(v)<2 else v
         roe=pct(roe); roa=pct(roa)
         f1,f2,f3,f4,f5,f6,f7=st.columns(7)
@@ -598,12 +651,15 @@ with tab2:
         for fig_f in build_fin_charts(rat_df,inc_df):
             st.plotly_chart(fig_f,use_container_width=True)
         items_f,total_f=score_fundamental(rat_df)
-        if "earnings_per_share" in rat_df.columns and "year" in rat_df.columns:
-            growth_df = rat_df[["year","earnings_per_share","pe_ratio","roe","net_margin"]].sort_values("year").tail(5).copy()
-            growth_df["EPS tăng trưởng"] = growth_df["earnings_per_share"].pct_change()*100
-            growth_df["EPS tăng trưởng"] = growth_df["EPS tăng trưởng"].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+        eps_row = rat_df[rat_df['item_id'] == 'earnings_per_share']
+        if not eps_row.empty and year_cols:
+            eps_vals = pd.to_numeric(eps_row[year_cols].values[0], errors='coerce')
+            growth_df = pd.DataFrame({'Năm': year_cols, 'EPS (đ)': eps_vals})
+            growth_df['Tăng trưởng'] = growth_df['EPS (đ)'].pct_change() * 100
+            growth_df['Tăng trưởng'] = growth_df['Tăng trưởng'].apply(lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+            growth_df['EPS (đ)'] = growth_df['EPS (đ)'].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
             st.markdown("### 📈 Tăng trưởng EPS theo năm")
-            st.dataframe(growth_df.rename(columns={"year":"Năm","earnings_per_share":"EPS","pe_ratio":"P/E","roe":"ROE%","net_margin":"Biên ròng%"}).reset_index(drop=True), use_container_width=True, hide_index=True)
+            st.dataframe(growth_df, use_container_width=True, hide_index=True)
         if items_f:
             st.markdown("### ✅ Chấm điểm cơ bản")
             chip_cols=st.columns(len(items_f))
