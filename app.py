@@ -19,27 +19,56 @@ st.set_page_config(layout="wide", page_title="Pro Trader Terminal", page_icon="�
 
 # ══════════════════════════════ CSS ═══════════════════════════════════════════
 st.markdown("""<style>
+/* Nền tối */
 [data-testid="stAppViewContainer"],[data-testid="stMain"]{background:#07121e!important}
 [data-testid="stHeader"]{background:#07121e!important}
 [data-testid="stSidebar"]{background:#0c1d2e!important;border-right:1px solid #163350}
-section[data-testid="stSidebar"] *{color:#cce0ff!important}
-.stTabs [data-baseweb="tab-list"]{background:#0c1d2e;border-radius:8px;padding:4px;gap:4px}
-.stTabs [data-baseweb="tab"]{background:transparent;color:#6a9cc8;border-radius:6px;
-  padding:7px 20px;font-size:13px;font-weight:500;border:none}
+section[data-testid="stSidebar"] *{color:#cce0ff!important;font-size:14px!important}
+
+/* Tabs - lớn hơn */
+.stTabs [data-baseweb="tab-list"]{background:#0c1d2e;border-radius:10px;padding:5px;gap:5px}
+.stTabs [data-baseweb="tab"]{background:transparent;color:#6a9cc8;border-radius:8px;
+  padding:10px 24px;font-size:15px;font-weight:500;border:none}
 .stTabs [aria-selected="true"]{background:#163350!important;color:#ffffff!important}
+
+/* Metric cards - to hơn */
 [data-testid="metric-container"]{background:#0c1d2e!important;border:1px solid #163350!important;
-  border-radius:10px!important;padding:12px 16px!important}
-[data-testid="stMetricLabel"] p{color:#6a9cc8!important;font-size:11px!important}
-[data-testid="stMetricValue"]{color:#ffffff!important;font-size:20px!important;font-weight:600!important}
+  border-radius:12px!important;padding:16px 20px!important}
+[data-testid="stMetricLabel"] p{color:#6a9cc8!important;font-size:13px!important;
+  letter-spacing:0.3px;font-weight:500!important}
+[data-testid="stMetricValue"]{color:#ffffff!important;font-size:26px!important;
+  font-weight:700!important;line-height:1.2!important}
+[data-testid="stMetricDelta"]{font-size:13px!important}
+
+/* Buttons */
 [data-testid="stButton"] button{background:#163350!important;color:#cce0ff!important;
-  border:1px solid #2a5a8a!important;border-radius:7px!important;font-weight:500!important}
+  border:1px solid #2a5a8a!important;border-radius:8px!important;font-weight:500!important;
+  font-size:14px!important;padding:8px 16px!important}
 [data-testid="stButton"] button:hover{background:#1e4a70!important}
-.stDataFrame{border:1px solid #163350!important;border-radius:8px!important}
-div[data-testid="stExpander"]{background:#0c1d2e!important;border:1px solid #163350!important;border-radius:8px!important}
+
+/* DataFrames */
+.stDataFrame{border:1px solid #163350!important;border-radius:10px!important}
+.stDataFrame td,.stDataFrame th{font-size:14px!important;padding:8px 12px!important}
+
+/* Expander */
+div[data-testid="stExpander"]{background:#0c1d2e!important;border:1px solid #163350!important;
+  border-radius:10px!important}
+div[data-testid="stExpander"] summary{font-size:14px!important;font-weight:500!important}
+
+/* Text */
 hr{border-color:#163350!important}
-p,span,label{color:#cce0ff}
-h1,h2,h3{color:#ffffff}
-.stAlert > div{background:#0c1d2e!important;border:1px solid #163350!important}
+p,span,label,div{color:#cce0ff;font-size:14px}
+h1{color:#ffffff;font-size:28px!important;font-weight:700!important}
+h2{color:#ffffff;font-size:22px!important;font-weight:600!important}
+h3{color:#ffffff;font-size:18px!important;font-weight:600!important}
+.stAlert > div{background:#0c1d2e!important;border:1px solid #163350!important;font-size:14px!important}
+
+/* Selectbox, input */
+[data-testid="stSelectbox"] div,[data-testid="stTextInput"] input{
+  font-size:15px!important;color:#ffffff!important}
+
+/* Caption */
+.stCaption{font-size:13px!important;color:#6a9cc8!important}
 </style>""", unsafe_allow_html=True)
 
 # ══════════════════════════════ CONSTANTS ══════════════════════════════════════
@@ -299,11 +328,25 @@ def score_fundamental(rat_df: pd.DataFrame):
                         and bool(re.search(r'\d{4}', str(c)))])
     latest_yr = year_cols[-1] if year_cols else None
 
+    _AL = {
+        'pe_ratio':          ['pe_ratio','p_e'],
+        'pb_ratio':          ['pb_ratio','p_b'],
+        'roe':               ['roe'],
+        'roa':               ['roa'],
+        'earnings_per_share':['earnings_per_share','eps'],
+        'debt_to_equity':    ['debt_to_equity','debt_equity'],
+        'current_ratio':     ['current_ratio'],
+        'gross_margin':      ['gross_margin','gross_profit_margin'],
+        'net_margin':        ['net_margin','net_profit_margin'],
+    }
     def gv(item_id):
-        row = rat_df[rat_df['item_id'] == item_id]
-        if row.empty or latest_yr is None: return None
-        v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
-        return float(v) if pd.notna(v) else None
+        if latest_yr is None: return None
+        for alias in _AL.get(item_id, [item_id]):
+            row = rat_df[rat_df['item_id'] == alias]
+            if not row.empty:
+                v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+                return float(v) if pd.notna(v) else None
+        return None
 
     def pct(v): return v*100 if v and abs(v)<2 else v
 
@@ -386,12 +429,21 @@ def build_fin_charts(rat_df, inc_df):
     if not year_cols: return charts
     x = year_cols  # ['2021','2022','2023','2024']
 
+    _CA = {
+        'earnings_per_share':['earnings_per_share','eps'],
+        'pe_ratio':          ['pe_ratio','p_e'],
+        'pb_ratio':          ['pb_ratio','p_b'],
+        'roe':               ['roe'],
+        'roa':               ['roa'],
+        'gross_margin':      ['gross_margin','gross_profit_margin'],
+        'net_margin':        ['net_margin','net_profit_margin'],
+    }
     def get_series(item_id):
-        """Lấy chuỗi giá trị theo năm cho 1 chỉ số."""
-        row = rat_df[rat_df['item_id'] == item_id]
-        if row.empty: return None
-        vals = pd.to_numeric(row[year_cols].values[0], errors='coerce')
-        return vals
+        for alias in _CA.get(item_id, [item_id]):
+            row = rat_df[rat_df['item_id'] == alias]
+            if not row.empty:
+                return pd.to_numeric(row[year_cols].values[0], errors='coerce')
+        return None
 
     eps_s = get_series('earnings_per_share')
     roe_s = get_series('roe')
@@ -454,10 +506,10 @@ def signal_banner(sig, score):
     pct=min(100,max(0,(score+7)/14*100))
     return f"""<div style='background:#0c1d2e;border:1px solid #163350;border-radius:10px;
       padding:14px 18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin:8px 0;'>
-  <div><div style='font-size:10px;color:#6a9cc8;letter-spacing:1px;'>TÍN HIỆU KỸ THUẬT</div>
-       <div style='font-size:26px;font-weight:700;color:{clr};'>{sig}</div></div>
-  <div style='text-align:center;'><div style='font-size:10px;color:#6a9cc8;'>ĐIỂM</div>
-       <div style='font-size:28px;font-weight:700;color:{sc_clr};'>{score}</div></div>
+  <div><div style='font-size:13px;color:#6a9cc8;letter-spacing:1px;font-weight:500;'>TÍN HIỆU KỸ THUẬT</div>
+       <div style='font-size:30px;font-weight:700;color:{clr};'>{sig}</div></div>
+  <div style='text-align:center;'><div style='font-size:13px;color:#6a9cc8;font-weight:500;'>ĐIỂM</div>
+       <div style='font-size:32px;font-weight:700;color:{sc_clr};'>{score}</div></div>
   <div style='flex:1;min-width:200px;'>
     <div style='font-size:9px;color:#3a6080;letter-spacing:1px;margin-bottom:4px;'>BÁN MẠNH ←─────────→ MUA MẠNH</div>
     <div style='height:8px;background:#102030;border-radius:4px;overflow:hidden;'>
@@ -467,16 +519,16 @@ def signal_banner(sig, score):
 </div>"""
 
 def trade_card_html(icon, title, val, sub, border):
-    return f"""<div style='background:#0c1d2e;border:1px solid {border};border-radius:9px;padding:11px 13px;'>
-  <div style='font-size:10px;color:{border};letter-spacing:.5px;margin-bottom:3px;'>{icon} {title}</div>
-  <div style='font-size:18px;font-weight:700;color:#ffffff;'>{val}</div>
-  <div style='font-size:11px;color:#6a9cc8;margin-top:2px;'>{sub}</div>
+    return f"""<div style='background:#0c1d2e;border:1px solid {border};border-radius:12px;padding:14px 16px;'>
+  <div style='font-size:12px;color:{border};letter-spacing:.5px;margin-bottom:6px;font-weight:500;'>{icon} {title}</div>
+  <div style='font-size:22px;font-weight:700;color:#ffffff;line-height:1.2;'>{val}</div>
+  <div style='font-size:13px;color:#6a9cc8;margin-top:4px;'>{sub}</div>
 </div>"""
 
 def metric_html(label, value_str, color="#ffffff"):
-    return f"""<div style='background:#0c1d2e;border:1px solid #163350;border-radius:9px;padding:10px 13px;'>
-  <div style='font-size:10px;color:#6a9cc8;letter-spacing:.5px;margin-bottom:3px;'>{label}</div>
-  <div style='font-size:17px;font-weight:600;color:{color};'>{value_str}</div>
+    return f"""<div style='background:#0c1d2e;border:1px solid #163350;border-radius:12px;padding:14px 16px;'>
+  <div style='font-size:12px;color:#6a9cc8;letter-spacing:.5px;margin-bottom:6px;font-weight:500;'>{label}</div>
+  <div style='font-size:22px;font-weight:700;color:{color};line-height:1.2;'>{value_str}</div>
 </div>"""
 
 def fund_chip(item):
@@ -485,11 +537,11 @@ def fund_chip(item):
     ico="✅" if ok else "❌" if ok is False else "⚪"
     vs=f"{val:,.1f}" if isinstance(val,float) and val is not None else (str(val) if val else "—")
     note=item["good"] if ok else (item["bad"] if ok is False else "Không có dữ liệu")
-    return f"""<div style='background:#0c1d2e;border:1px solid {clr}50;border-radius:9px;padding:9px 11px;text-align:center;'>
-  <div style='font-size:18px;'>{ico}</div>
-  <div style='font-size:12px;font-weight:600;color:#cce0ff;margin:3px 0;'>{lbl}</div>
-  <div style='font-size:14px;font-weight:700;color:{clr};'>{vs}</div>
-  <div style='font-size:9px;color:#6a9cc8;margin-top:3px;line-height:1.4;'>{note}</div>
+    return f"""<div style='background:#0c1d2e;border:1px solid {clr}50;border-radius:12px;padding:14px 13px;text-align:center;'>
+  <div style='font-size:24px;margin-bottom:4px;'>{ico}</div>
+  <div style='font-size:14px;font-weight:600;color:#cce0ff;margin:5px 0;'>{lbl}</div>
+  <div style='font-size:20px;font-weight:700;color:{clr};'>{vs}</div>
+  <div style='font-size:12px;color:#6a9cc8;margin-top:5px;line-height:1.5;'>{note}</div>
 </div>"""
 
 def score_pill(label, s, weight_pct):
@@ -620,14 +672,27 @@ with tab2:
                             and bool(re.search(r'\d{4}', str(c)))])
         latest_yr = year_cols[-1] if year_cols else None
 
+        _TAB2_AL = {
+            'pe_ratio':          ['pe_ratio','p_e'],
+            'pb_ratio':          ['pb_ratio','p_b'],
+            'roe':               ['roe'],
+            'roa':               ['roa'],
+            'earnings_per_share':['earnings_per_share','eps'],
+            'debt_to_equity':    ['debt_to_equity','debt_equity'],
+            'current_ratio':     ['current_ratio'],
+            'gross_margin':      ['gross_margin','gross_profit_margin'],
+            'net_margin':        ['net_margin','net_profit_margin'],
+        }
         def grat(item_id):
-            """Lấy giá trị mới nhất của chỉ số từ long format."""
-            row = rat_df[rat_df['item_id'] == item_id]
-            if row.empty or latest_yr is None: return None
-            v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
-            return float(v) if pd.notna(v) else None
+            if latest_yr is None: return None
+            for alias in _TAB2_AL.get(item_id, [item_id]):
+                row = rat_df[rat_df['item_id'] == alias]
+                if not row.empty:
+                    v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+                    return float(v) if pd.notna(v) else None
+            return None
 
-        def pct(v): return v*100 if v and abs(v) < 2 else v
+        def pct(v): return v*100 if v and abs(v)<2 else v
 
         pe  = grat('pe_ratio')
         pb  = grat('pb_ratio')
@@ -638,8 +703,6 @@ with tab2:
         cr  = grat('current_ratio')
         gm  = pct(grat('gross_margin'))
         nm  = pct(grat('net_margin'))
-        def pct(v): return v*100 if v and abs(v)<2 else v
-        roe=pct(roe); roa=pct(roa)
         f1,f2,f3,f4,f5,f6,f7=st.columns(7)
         f1.markdown(metric_html("P/E",f"{pe:.1f}x" if pe else "—","#00d97e" if pe and 0<pe<20 else "#ff3d5a" if pe else "#8baed4"),unsafe_allow_html=True)
         f2.markdown(metric_html("P/B",f"{pb:.2f}x" if pb else "—","#00d97e" if pb and 0<pb<4 else "#ff3d5a" if pb else "#8baed4"),unsafe_allow_html=True)
@@ -651,7 +714,7 @@ with tab2:
         for fig_f in build_fin_charts(rat_df,inc_df):
             st.plotly_chart(fig_f,use_container_width=True)
         items_f,total_f=score_fundamental(rat_df)
-        eps_row = rat_df[rat_df['item_id'] == 'earnings_per_share']
+        eps_row = rat_df[rat_df['item_id'].isin(['earnings_per_share','eps'])]
         if not eps_row.empty and year_cols:
             eps_vals = pd.to_numeric(eps_row[year_cols].values[0], errors='coerce')
             growth_df = pd.DataFrame({'Năm': year_cols, 'EPS (đ)': eps_vals})
