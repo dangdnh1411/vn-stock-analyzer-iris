@@ -375,14 +375,19 @@ def build_fin_charts(rat_df, inc_df):
     charts=[]
     if rat_df.empty: return charts
     year_col=next((c for c in rat_df.columns if "year" in c.lower() or "năm" in c.lower()),None)
-    eps_col =next((c for c in rat_df.columns if "eps" in c.lower() or "thu nhập mỗi" in c.lower()),None)
-    roe_col =next((c for c in rat_df.columns if c.lower()=="roe" or "lợi nhuận trên vốn" in c.lower()),None)
-    roa_col =next((c for c in rat_df.columns if c.lower()=="roa" or "lợi nhuận trên tổng" in c.lower()),None)
+    eps_col = next((c for c in rat_df.columns if c.lower() in ["earnings_per_share","eps"]), None)
+    roe_col = next((c for c in rat_df.columns if c.lower() == "roe"), None)
+    roa_col = next((c for c in rat_df.columns if c.lower() == "roa"), None)
+    rev_col  = next((c for c in inc_df.columns if c.lower() == "revenue"), None)
+    prof_col = next((c for c in inc_df.columns if c.lower() == "net_profit"), None)
+    gm_col = next((c for c in rat_df.columns if c.lower() == "gross_margin"), None)
+    nm_col = next((c for c in rat_df.columns if c.lower() == "net_margin"), None)
 
     rdf=rat_df.sort_values(year_col,ascending=True).tail(8) if year_col else rat_df.tail(8)
     x=rdf[year_col].astype(str) if year_col else list(range(len(rdf)))
 
     fig=make_subplots(rows=1,cols=2,subplot_titles=("EPS theo năm","ROE & ROA xu hướng (%)"))
+    fig2 = make_subplots(rows=1, cols=2,subplot_titles=("Doanh thu & Lợi nhuận ròng", "Biên lợi nhuận (%)"))
     if eps_col:
         ev=pd.to_numeric(rdf[eps_col],errors="coerce")
         bc=["#00d97e" if v>=0 else "#ff3d5a" for v in ev.fillna(0)]
@@ -573,10 +578,13 @@ with tab2:
     if not rat_df.empty:
         st.markdown("### 📊 Chỉ số tài chính (kỳ mới nhất)")
         r=rat_df.iloc[0]
-        pe=_safe(r,"pe_ratio","P/E"); pb=_safe(r,"pb_ratio","P/B")
-        eps=_safe(r,"earnings_per_share","EPS","Thu nhập mỗi cổ phiếu")
-        roe=_safe(r,"roe","ROE"); roa=_safe(r,"roa","ROA")
-        de=_safe(r,"debt_to_equity","D/E"); cr=_safe(r,"current_ratio")
+        eps = _safe(r, "earnings_per_share", "eps")
+        roe = _safe(r, "roe")
+        roa = _safe(r, "roa")
+        pe  = _safe(r, "pe_ratio")
+        pb  = _safe(r, "pb_ratio")
+        de  = _safe(r, "debt_to_equity")
+        cr  = _safe(r, "current_ratio")
         def pct(v): return v*100 if v and abs(v)<2 else v
         roe=pct(roe); roa=pct(roa)
         f1,f2,f3,f4,f5,f6,f7=st.columns(7)
@@ -590,6 +598,17 @@ with tab2:
         for fig_f in build_fin_charts(rat_df,inc_df):
             st.plotly_chart(fig_f,use_container_width=True)
         items_f,total_f=score_fundamental(rat_df)
+      if "earnings_per_share" in rat_df.columns and "year" in rat_df.columns:
+    growth_df = rat_df[["year","earnings_per_share","pe_ratio","roe","net_margin"]]\
+                .sort_values("year").tail(5).copy()
+    growth_df["EPS tăng trưởng"] = growth_df["earnings_per_share"].pct_change()*100
+    growth_df["EPS tăng trưởng"] = growth_df["EPS tăng trưởng"].apply(
+        lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+    st.markdown("### 📈 Tăng trưởng EPS theo năm")
+    st.dataframe(growth_df.rename(columns={
+        "year":"Năm","earnings_per_share":"EPS","pe_ratio":"P/E",
+        "roe":"ROE%","net_margin":"Biên ròng%"
+    }).reset_index(drop=True), use_container_width=True, hide_index=True)
         if items_f:
             st.markdown("### ✅ Chấm điểm cơ bản")
             chip_cols=st.columns(len(items_f))
@@ -640,6 +659,83 @@ with tab3:
     vol_trend["Close"]=vol_trend["Close"].apply(lambda x:f"{x:,.0f}")
     vol_trend=vol_trend.rename(columns={"Date":"Ngày","Volume":"Khối lượng","Close":"Giá đóng cửa","Vol_Ratio":"Vol/TB"})
     st.dataframe(vol_trend.tail(15).reset_index(drop=True),use_container_width=True,hide_index=True)
+  # Thêm hàm phân tích bơm/xả — đặt cùng với các hàm khác
+def analyze_pump_dump(df):
+    """Phát hiện dấu hiệu bơm/xả từ price-volume action."""
+    signals = []
+    d = df.tail(20).copy()
+    
+    # 1. Bơm: Giá tăng mạnh + Vol đột biến
+    pump = d[(d["Vol_Ratio"] > 2.0) & (d["Close"] > d["Open"]) & 
+             (d["Close"].pct_change() > 0.03)]
+    if len(pump) > 0:
+        signals.append(("🚨 DẤU HIỆU BƠM", "warning",
+            f"{len(pump)} phiên gần đây: giá tăng >3% kèm khối lượng đột biến >2x. "
+            "Cẩn thận bẫy thanh khoản — bơm để xả."))
+    
+    # 2. Xả: Giá giảm + Vol đột biến 
+    dump = d[(d["Vol_Ratio"] > 2.0) & (d["Close"] < d["Open"]) &
+             (d["Close"].pct_change() < -0.03)]
+    if len(dump) > 0:
+        signals.append(("🔴 DẤU HIỆU XẢ HÀNG", "error",
+            f"{len(dump)} phiên: giá giảm >3% kèm khối lượng lớn. "
+            "Áp lực bán mạnh từ tay to."))
+    
+    # 3. Phân kỳ âm: giá tăng nhưng vol giảm dần
+    last5  = d.tail(5)
+    price_up  = last5["Close"].iloc[-1] > last5["Close"].iloc[0]
+    vol_down  = last5["Volume"].iloc[-1] < last5["Volume"].iloc[0]
+    if price_up and vol_down:
+        signals.append(("⚠️ PHÂN KỲ VOLUME", "warning",
+            "Giá tăng nhưng khối lượng suy giảm 5 phiên gần nhất. "
+            "Xu hướng tăng thiếu động lực — rủi ro đảo chiều."))
+    
+    # 4. Khối lượng cạn kiệt: Vol < 0.3x TB
+    if df["Vol_Ratio"].tail(3).mean() < 0.3:
+        signals.append(("😴 THANH KHOẢN CẠN", "info",
+            "Khối lượng 3 phiên liên tiếp dưới 30% trung bình. "
+            "Thị trường mất quan tâm — không nên giao dịch."))
+    
+    # 5. Bình thường
+    if not signals:
+        signals.append(("✅ BÌNH THƯỜNG", "success",
+            "Không phát hiện dấu hiệu bất thường về khối lượng."))
+    return signals
+# Trong Tab 3, sau biểu đồ, thêm:
+signals = analyze_pump_dump(df)
+st.markdown("### 🔍 Phân tích dấu hiệu bơm/xả")
+for title, level, desc in signals:
+    if level == "warning": st.warning(f"**{title}** — {desc}")
+    elif level == "error":  st.error(f"**{title}** — {desc}")
+    elif level == "success":st.success(f"**{title}** — {desc}")
+    else:                   st.info(f"**{title}** — {desc}")
+      # Chart 2 panel: giá trên, vol/TB dưới — cùng trục X để thấy divergence rõ
+fig_pv = make_subplots(rows=2, cols=1, shared_xaxes=True,
+    vertical_spacing=0.04, row_heights=[0.6, 0.4],
+    subplot_titles=("Giá đóng cửa", "Vol/TB (đường 1x = bình thường)"))
+
+show_pv = df.tail(60)
+fig_pv.add_trace(go.Scatter(x=show_pv["Date"], y=show_pv["Close"],
+    line=dict(color="#4a9ef8", width=1.8), name="Giá"), row=1, col=1)
+fig_pv.add_trace(go.Bar(x=show_pv["Date"], y=show_pv["Vol_Ratio"],
+    marker_color=["#00d97e" if r.Close>=r.Open else "#ff3d5a" 
+                  for _,r in show_pv.iterrows()], name="Vol/TB"), row=2, col=1)
+fig_pv.add_hline(y=1.5, row=2, col=1,
+    line=dict(color="#f5a623", dash="dot", width=1),
+    annotation_text=" Ngưỡng đột biến 1.5x")
+fig_pv.add_hline(y=1.0, row=2, col=1,
+    line=dict(color="rgba(255,255,255,0.2)", dash="dot", width=0.8))
+# Cuối Tab 3, thêm bảng 3 cột nhận định:
+col_a, col_b, col_c = st.columns(3)
+
+# Tính các chỉ số
+avg_vol_up   = df[df["Close"]>=df["Open"]]["Vol_Ratio"].tail(20).mean()
+avg_vol_down = df[df["Close"]<df["Open"]]["Vol_Ratio"].tail(20).mean()
+trend_vol    = "Mua chiếm ưu thế 🟢" if avg_vol_up > avg_vol_down else "Bán chiếm ưu thế 🔴"
+
+col_a.metric("Vol trung bình ngày tăng", f"×{avg_vol_up:.2f}", "so TB 20 phiên")
+col_b.metric("Vol trung bình ngày giảm", f"×{avg_vol_down:.2f}", "so TB 20 phiên")  
+col_c.metric("Nhận định dòng tiền", trend_vol)
 
 # ── TAB 4: TỔNG HỢP ────────────────────────────────────────────────────────
 with tab4:
