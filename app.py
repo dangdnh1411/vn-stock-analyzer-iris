@@ -598,17 +598,12 @@ with tab2:
         for fig_f in build_fin_charts(rat_df,inc_df):
             st.plotly_chart(fig_f,use_container_width=True)
         items_f,total_f=score_fundamental(rat_df)
-      if "earnings_per_share" in rat_df.columns and "year" in rat_df.columns:
-    growth_df = rat_df[["year","earnings_per_share","pe_ratio","roe","net_margin"]]\
-                .sort_values("year").tail(5).copy()
-    growth_df["EPS tăng trưởng"] = growth_df["earnings_per_share"].pct_change()*100
-    growth_df["EPS tăng trưởng"] = growth_df["EPS tăng trưởng"].apply(
-        lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
-    st.markdown("### 📈 Tăng trưởng EPS theo năm")
-    st.dataframe(growth_df.rename(columns={
-        "year":"Năm","earnings_per_share":"EPS","pe_ratio":"P/E",
-        "roe":"ROE%","net_margin":"Biên ròng%"
-    }).reset_index(drop=True), use_container_width=True, hide_index=True)
+        if "earnings_per_share" in rat_df.columns and "year" in rat_df.columns:
+            growth_df = rat_df[["year","earnings_per_share","pe_ratio","roe","net_margin"]].sort_values("year").tail(5).copy()
+            growth_df["EPS tăng trưởng"] = growth_df["earnings_per_share"].pct_change()*100
+            growth_df["EPS tăng trưởng"] = growth_df["EPS tăng trưởng"].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+            st.markdown("### 📈 Tăng trưởng EPS theo năm")
+            st.dataframe(growth_df.rename(columns={"year":"Năm","earnings_per_share":"EPS","pe_ratio":"P/E","roe":"ROE%","net_margin":"Biên ròng%"}).reset_index(drop=True), use_container_width=True, hide_index=True)
         if items_f:
             st.markdown("### ✅ Chấm điểm cơ bản")
             chip_cols=st.columns(len(items_f))
