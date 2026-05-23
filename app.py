@@ -61,7 +61,7 @@ CHART_STYLE = dict(
 
 # ══════════════════════════════ DATA LAYER (vnstock KBS) ══════════════════════
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_price(sym: str, days: int, interval: str) -> tuple[pd.DataFrame, str]:
+def fetch_price(sym: str, days: int, interval: str):
     """Lấy dữ liệu giá từ KBS. Trả về (df, source_note)."""
     end   = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -101,12 +101,12 @@ def fetch_price(sym: str, days: int, interval: str) -> tuple[pd.DataFrame, str]:
             raise RuntimeError(f"KBS: {e1} | Yahoo: {e2}")
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_ratio(sym: str) -> tuple[pd.DataFrame, str]:
+def fetch_ratio(sym: str):
     """Lấy chỉ số tài chính từ KBS."""
     try:
         from vnstock import Finance
         fin = Finance(symbol=sym.upper(), source="KBS")
-        df  = fin.ratio(period="year", lang="vi")
+        df  = fin.ratio(period="year")
         if df is None or df.empty: raise ValueError("Empty ratio")
         # Sort mới nhất lên đầu
         year_col = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
@@ -122,7 +122,7 @@ def fetch_income(sym: str) -> pd.DataFrame:
     try:
         from vnstock import Finance
         fin = Finance(symbol=sym.upper(), source="KBS")
-        df  = fin.income_statement(period="year", lang="vi")
+        df  = fin.income_statement(period="year")
         if df is None or df.empty: return pd.DataFrame()
         year_col = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
         if year_col:
@@ -289,7 +289,7 @@ def calc_trade(df, score):
                 risk=risk,reward=reward,rr=rr,fib=fib,atr=atr)
 
 # ══════════════════════════════ FUNDAMENTAL SCORING ════════════════════════════
-def score_fundamental(rat_df: pd.DataFrame) -> tuple[list, float]:
+def score_fundamental(rat_df: pd.DataFrame):
     """Chấm điểm cơ bản từ KBS ratio data."""
     items=[]; total=0.0
     if rat_df.empty: return items, total
