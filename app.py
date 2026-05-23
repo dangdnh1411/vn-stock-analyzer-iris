@@ -100,19 +100,110 @@ def fetch_price(sym: str, days: int, interval: str):
         except Exception as e2:
             raise RuntimeError(f"KBS: {e1} | Yahoo: {e2}")
 
+def _parse_best_json(text: str) -> dict:
+    """Tìm JSON object đầy đủ nhất trong text."""
+    candidates = []
+    depth = 0; start = -1
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if depth == 0: start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidates.append(text[start:i+1])
+    candidates.sort(key=len, reverse=True)
+    for c in candidates:
+        try:
+            data = json.loads(c)
+            if isinstance(data, dict) and any(k in data for k in ['pe','roe','pb','eps','roa']):
+                return data
+        except: pass
+    return {}
+
+def _claude_data_to_ratdf(data: dict) -> pd.DataFrame:
+    """Chuyển JSON từ Claude thành rat_df long-format."""
+    if not data: return pd.DataFrame()
+    years_data = data.get('years', {})
+    if not years_data:
+        yr = str(data.get('year', datetime.now().year))
+        years_data = {yr: data}
+    field_map = [
+        ('pe',  'pe_ratio',           'P/E'),
+        ('pb',  'pb_ratio',           'P/B'),
+        ('roe', 'roe',                'ROE'),
+        ('roa', 'roa',                'ROA'),
+        ('eps', 'earnings_per_share', 'EPS'),
+        ('de',  'debt_to_equity',     'Debt/Equity'),
+        ('cr',  'current_ratio',      'Current Ratio'),
+        ('gm',  'gross_margin',       'Gross Margin%'),
+        ('nm',  'net_margin',         'Net Margin%'),
+    ]
+    year_list = sorted(years_data.keys())
+    rows = []
+    for short_key, item_id, item_name in field_map:
+        row = {'item': item_name, 'item_id': item_id}
+        for yr in year_list:
+            row[yr] = years_data[yr].get(short_key)
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df.attrs['periods'] = year_list
+    df.attrs['source'] = 'Claude AI + Web Search'
+    return df
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ratio(sym: str):
-    """Lấy chỉ số tài chính từ KBS."""
+    """Lấy chỉ số tài chính: KBS → Claude AI fallback."""
+    import json as _json
+    # === Tầng 1: KBS ===
     try:
         from vnstock import Finance
         fin = Finance(symbol=sym.upper(), source="KBS")
         df  = fin.ratio(period="year")
-        if df is None or df.empty: raise ValueError("Empty ratio")
-        # Không sort - LONG format không có year column
-        # period columns = "2024", "2023"... dạng string
-        return df, "KBS Finance ✅"
-    except Exception as e:
-        return pd.DataFrame(), f"Lỗi: {e}"
+        if df is not None and not df.empty:
+            return df, "KBS Finance ✅"
+    except Exception as e_kbs:
+        pass
+    # === Tầng 2: Claude API + web_search ===
+    try:
+        prompt = (
+            f"Search for {sym} stock (Vietnam HOSE) latest financial ratios. "
+            f"Find P/E, P/B, ROE%, ROA%, EPS (VND), Debt/Equity, Current Ratio, "
+            f"Gross Margin%, Net Margin% for years 2021-2024. "
+            f"Return ONLY this JSON (no explanation):\n"
+            f'{{"pe":8.5,"pb":1.2,"roe":17.2,"roa":1.8,"eps":3250,"de":9.2,"cr":1.1,"gm":72.0,"nm":24.0,"year":2024,'
+            f'"years":{{"2021":{{"pe":12.5,"pb":2.3,"roe":19.5,"roa":2.0,"eps":2100}},'
+            f'"2022":{{"pe":9.1,"pb":1.8,"roe":20.1,"roa":2.1,"eps":2620}},'
+            f'"2023":{{"pe":7.2,"pb":1.1,"roe":15.5,"roa":1.6,"eps":2750}},'
+            f'"2024":{{"pe":8.5,"pb":1.2,"roe":17.2,"roa":1.8,"eps":3250}}}}}}'
+        )
+        import urllib.request
+        req_data = _json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1500,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = _json.loads(resp.read())
+        text = " ".join(
+            c.get("text","") for c in result.get("content",[])
+            if c.get("type") == "text"
+        )
+        data = _parse_best_json(text)
+        if data:
+            df = _claude_data_to_ratdf(data)
+            if not df.empty:
+                return df, "Claude AI + Web Search ✅"
+    except Exception as e_claude:
+        pass
+    return pd.DataFrame(), "Không lấy được dữ liệu tài chính"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_income(sym: str) -> pd.DataFrame:
@@ -635,6 +726,13 @@ with tab1:
 with tab2:
     if not rat_df.empty:
         st.markdown("### 📊 Chỉ số tài chính (kỳ mới nhất)")
+        # DEBUG: Hiển thị raw data để debug
+        with st.expander("🔧 Debug — Raw data từ KBS/Claude (click để xem)", expanded=False):
+            st.write(f"**Nguồn:** {ratio_src}")
+            st.write(f"**Shape:** {rat_df.shape}")
+            st.write(f"**Columns:** {list(rat_df.columns)}")
+            st.write(f"**attrs:** {rat_df.attrs}")
+            st.dataframe(rat_df, use_container_width=True)
         # Xác định cột năm (2021, 2022, 2023, 2024...)
         year_cols = sorted([c for c in rat_df.columns
                             if c not in ['item','item_id','item_en','unit','levels','row_number']
