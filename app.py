@@ -108,10 +108,8 @@ def fetch_ratio(sym: str):
         fin = Finance(symbol=sym.upper(), source="KBS")
         df  = fin.ratio(period="year")
         if df is None or df.empty: raise ValueError("Empty ratio")
-        # Sort mới nhất lên đầu
-        year_col = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
-        if year_col:
-            df = df.sort_values(year_col, ascending=False).reset_index(drop=True)
+        # Không sort - LONG format không có year column
+        # period columns = "2024", "2023"... dạng string
         return df, "KBS Finance ✅"
     except Exception as e:
         return pd.DataFrame(), f"Lỗi: {e}"
@@ -299,11 +297,23 @@ def score_fundamental(rat_df: pd.DataFrame):
                         and str(c).isdigit()])
     latest_yr = year_cols[-1] if year_cols else None
 
+    SCORE_ALIASES = {
+        'pe_ratio':          ['pe_ratio','p_e'],
+        'pb_ratio':          ['pb_ratio','p_b'],
+        'roe':               ['roe'],
+        'roa':               ['roa'],
+        'earnings_per_share':['earnings_per_share','eps'],
+        'debt_to_equity':    ['debt_to_equity','debt_equity'],
+        'current_ratio':     ['current_ratio'],
+    }
     def gv(item_id):
-        row = rat_df[rat_df['item_id'] == item_id]
-        if row.empty or latest_yr is None: return None
-        v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
-        return float(v) if pd.notna(v) else None
+        if latest_yr is None: return None
+        for alias in SCORE_ALIASES.get(item_id, [item_id]):
+            row = rat_df[rat_df['item_id'] == alias]
+            if not row.empty:
+                v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+                return float(v) if pd.notna(v) else None
+        return None
 
     def pct(v): return v*100 if v and abs(v)<2 else v
 
@@ -386,12 +396,23 @@ def build_fin_charts(rat_df, inc_df):
     if not year_cols: return charts
     x = year_cols  # ['2021','2022','2023','2024']
 
+    CHART_ALIASES = {
+        'pe_ratio':          ['pe_ratio','p_e'],
+        'pb_ratio':          ['pb_ratio','p_b'],
+        'roe':               ['roe'],
+        'roa':               ['roa'],
+        'earnings_per_share':['earnings_per_share','eps'],
+        'debt_to_equity':    ['debt_to_equity','debt_equity'],
+        'gross_margin':      ['gross_margin','gross_profit_margin'],
+        'net_margin':        ['net_margin','net_profit_margin'],
+    }
     def get_series(item_id):
-        """Lấy chuỗi giá trị theo năm cho 1 chỉ số."""
-        row = rat_df[rat_df['item_id'] == item_id]
-        if row.empty: return None
-        vals = pd.to_numeric(row[year_cols].values[0], errors='coerce')
-        return vals
+        """Lấy chuỗi giá trị theo năm — tìm theo aliases."""
+        for alias in CHART_ALIASES.get(item_id, [item_id]):
+            row = rat_df[rat_df['item_id'] == alias]
+            if not row.empty:
+                return pd.to_numeric(row[year_cols].values[0], errors='coerce')
+        return None
 
     eps_s = get_series('earnings_per_share')
     roe_s = get_series('roe')
@@ -620,12 +641,27 @@ with tab2:
                             and str(c).isdigit()])
         latest_yr = year_cols[-1] if year_cols else None
 
+        # Map aliases: KBS có thể trả item_id khác tùy NameEn
+        ALIASES = {
+            'pe_ratio':          ['pe_ratio','p_e'],
+            'pb_ratio':          ['pb_ratio','p_b'],
+            'roe':               ['roe'],
+            'roa':               ['roa'],
+            'earnings_per_share':['earnings_per_share','eps'],
+            'debt_to_equity':    ['debt_to_equity','debt_equity'],
+            'current_ratio':     ['current_ratio'],
+            'gross_margin':      ['gross_margin','gross_profit_margin'],
+            'net_margin':        ['net_margin','net_profit_margin'],
+        }
         def grat(item_id):
-            """Lấy giá trị mới nhất của chỉ số từ long format."""
-            row = rat_df[rat_df['item_id'] == item_id]
-            if row.empty or latest_yr is None: return None
-            v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
-            return float(v) if pd.notna(v) else None
+            """Lấy giá trị mới nhất — tìm theo aliases."""
+            if latest_yr is None: return None
+            for alias in ALIASES.get(item_id, [item_id]):
+                row = rat_df[rat_df['item_id'] == alias]
+                if not row.empty:
+                    v = pd.to_numeric(row[latest_yr].values[0], errors='coerce')
+                    return float(v) if pd.notna(v) else None
+            return None
 
         def pct(v): return v*100 if v and abs(v) < 2 else v
 
@@ -649,7 +685,7 @@ with tab2:
         for fig_f in build_fin_charts(rat_df,inc_df):
             st.plotly_chart(fig_f,use_container_width=True)
         items_f,total_f=score_fundamental(rat_df)
-        eps_row = rat_df[rat_df['item_id'] == 'earnings_per_share']
+        eps_row = rat_df[rat_df['item_id'].isin(['earnings_per_share','eps'])]
         if not eps_row.empty and year_cols:
             eps_vals = pd.to_numeric(eps_row[year_cols].values[0], errors='coerce')
             growth_df = pd.DataFrame({'Năm': year_cols, 'EPS (đ)': eps_vals})
