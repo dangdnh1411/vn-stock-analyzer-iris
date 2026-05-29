@@ -863,7 +863,7 @@ with st.sidebar:
              "EMA50":c1.checkbox("EMA 50",True),"EMA200":c2.checkbox("EMA 200",False)}
     ema_list=[k for k,v in ema_sel.items() if v]
     run=st.button("🚀 Phân tích ngay",use_container_width=True)
-    if st.button("🗑️ Xóa cache",use_container_width=True,help="Xóa dữ liệu cũ, tải lại mới nhất"):
+  if st.button("🗑️ Xóa cache",use_container_width=True,help="Xóa dữ liệu cũ, tải lại mới nhất"):
         st.cache_data.clear()
         for k in ["scan_results","scan_key","cmp_data"]:
             if k in st.session_state: del st.session_state[k]
