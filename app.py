@@ -14,7 +14,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import math, time, re, json, urllib.request
 
-st.set_page_config(layout="wide", page_title="Pro Trader Terminal", page_icon="📈",
+st.set_page_config(layout="wide", page_title="Irisss", page_icon="📈",
                    initial_sidebar_state="expanded")
 
 # ══════════════════════════════ CSS ═══════════════════════════════════════════
@@ -781,18 +781,30 @@ def build_fin_charts(rat_df, inc_df):
 
 # ══════════════════════════════ UI COMPONENTS ══════════════════════════════════
 def signal_banner(sig, score):
-    clr=SIG_COLOR.get(sig,"#8baed4"); sc_clr="#00d97e" if score>=2 else "#ff3d5a" if score<=-2 else "#f5a623"
-    pct=min(100,max(0,(score+7)/14*100))
-    return f"""<div style='background:#0c1d2e;border:1px solid #163350;border-radius:10px;
-      padding:14px 18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin:8px 0;'>
-  <div><div style='font-size:10px;color:#6a9cc8;letter-spacing:1px;'>TÍN HIỆU KỸ THUẬT</div>
-       <div style='font-size:26px;font-weight:700;color:{clr};'>{sig}</div></div>
-  <div style='text-align:center;'><div style='font-size:10px;color:#6a9cc8;'>ĐIỂM</div>
-       <div style='font-size:28px;font-weight:700;color:{sc_clr};'>{score}</div></div>
+    clr = SIG_COLOR.get(sig, "#8baed4")
+    sc_clr = "#00d97e" if score>=2 else "#ff3d5a" if score<=-2 else "#f5a623"
+    pct = min(100, max(0, (score+7)/14*100))
+    # Gradient theo tín hiệu
+    if score >= 2.5:
+        grad = "linear-gradient(135deg,#00d97e,#00b369)"
+        shadow = "rgba(0,217,126,0.35)"
+    elif score <= -2.5:
+        grad = "linear-gradient(135deg,#ff4757,#cc1133)"
+        shadow = "rgba(255,71,87,0.35)"
+    else:
+        grad = "linear-gradient(135deg,#163350,#0c2540)"
+        shadow = "rgba(0,0,0,0)"
+    return f"""<div style='background:{grad};border-radius:10px;
+      padding:14px 18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;
+      margin:8px 0;box-shadow:0 4px 18px {shadow};'>
+  <div><div style='font-size:10px;color:rgba(255,255,255,.65);letter-spacing:1px;'>TÍN HIỆU KỸ THUẬT</div>
+       <div style='font-size:26px;font-weight:700;color:#fff;text-shadow:0 1px 6px rgba(0,0,0,.3);'>{sig}</div></div>
+  <div style='text-align:center;'><div style='font-size:10px;color:rgba(255,255,255,.65);'>ĐIỂM</div>
+       <div style='font-size:28px;font-weight:700;color:#fff;'>{score}</div></div>
   <div style='flex:1;min-width:200px;'>
-    <div style='font-size:9px;color:#3a6080;letter-spacing:1px;margin-bottom:4px;'>BÁN MẠNH ←─────────→ MUA MẠNH</div>
-    <div style='height:8px;background:#102030;border-radius:4px;overflow:hidden;'>
-      <div style='height:100%;width:{pct}%;background:{clr};border-radius:4px;'></div>
+    <div style='font-size:9px;color:rgba(255,255,255,.5);letter-spacing:1px;margin-bottom:4px;'>BÁN MẠNH ←─────────→ MUA MẠNH</div>
+    <div style='height:8px;background:rgba(0,0,0,.25);border-radius:4px;overflow:hidden;'>
+      <div style='height:100%;width:{pct}%;background:rgba(255,255,255,.7);border-radius:4px;'></div>
     </div>
   </div>
 </div>"""
@@ -851,6 +863,11 @@ with st.sidebar:
              "EMA50":c1.checkbox("EMA 50",True),"EMA200":c2.checkbox("EMA 200",False)}
     ema_list=[k for k,v in ema_sel.items() if v]
     run=st.button("🚀 Phân tích ngay",use_container_width=True)
+    if st.button("🗑️ Xóa cache",use_container_width=True,help="Xóa dữ liệu cũ, tải lại mới nhất"):
+        st.cache_data.clear()
+        for k in ["scan_results","scan_key","cmp_data"]:
+            if k in st.session_state: del st.session_state[k]
+        st.rerun()
     auto_r=st.checkbox("Tự động refresh",value=False)
     if auto_r: ref_sec=st.select_slider("Tần suất (giây)",[30,60,120,300],value=60)
     st.markdown("---")
