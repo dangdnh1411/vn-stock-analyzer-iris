@@ -120,6 +120,24 @@ def fetch_price(sym: str, days: int, interval: str):
             raise RuntimeError(f"KBS: {e1} | Yahoo: {e2}")
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _flatten_vci_cols(df):
+    """Flatten MultiIndex columns của VCI, giữ TÊN ĐẦY ĐỦ field + đảm bảo duy nhất.
+    VCI MultiIndex: (nhóm, field) → lấy field (phần tử cuối tuple), KHÔNG cắt theo '_'."""
+    if isinstance(df.columns, pd.MultiIndex):
+        # Lấy phần tử CUỐI của mỗi tuple (tên field thật), bỏ phần nhóm
+        df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
+    # Dedup: nếu trùng tên → thêm hậu tố .1, .2...
+    seen = {}; new_cols = []
+    for c in df.columns:
+        c = str(c)
+        if c in seen:
+            seen[c] += 1; new_cols.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0; new_cols.append(c)
+    df.columns = new_cols
+    return df
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_ratio(sym: str):
     """Chỉ số tài chính: VCI (có EPS đầy đủ) → KBS → trống.
     VCI trả WIDE format (cột=chỉ số), KBS trả LONG format (item_id)."""
@@ -130,15 +148,10 @@ def fetch_ratio(sym: str):
         fin = Finance(symbol=sym, source="VCI")
         df = fin.ratio(period="year", lang="en", dropna=False)
         if df is not None and not df.empty:
-            # Flatten MultiIndex nếu có
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = ['_'.join(str(x) for x in c if str(x)!='nan').strip('_')
-                              for c in df.columns]
-                # Bỏ prefix Meta_ / nhóm
-                df.columns = [c.split('_')[-1] if '_' in c else c for c in df.columns]
-            # Sort theo năm tăng dần
+            df = _flatten_vci_cols(df)
             yc = next((c for c in df.columns if 'year' in str(c).lower()), None)
-            if yc: df = df.sort_values(yc).reset_index(drop=True)
+            if yc:
+                df = df.sort_values(yc).reset_index(drop=True)
             return df, "VCI Finance ✅"
     except Exception:
         pass
@@ -162,11 +175,10 @@ def fetch_income(sym: str) -> pd.DataFrame:
         fin = Finance(symbol=sym, source="VCI")
         df = fin.income_statement(period="year", lang="en", dropna=False)
         if df is not None and not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = ['_'.join(str(x) for x in c if str(x)!='nan').strip('_') for c in df.columns]
-                df.columns = [c.split('_')[-1] if '_' in c else c for c in df.columns]
+            df = _flatten_vci_cols(df)
             yc = next((c for c in df.columns if 'year' in str(c).lower()), None)
-            if yc: df = df.sort_values(yc).reset_index(drop=True)
+            if yc:
+                df = df.sort_values(yc).reset_index(drop=True)
             return df
     except Exception:
         pass
@@ -343,6 +355,26 @@ def fmt(n, suffix=""):
     if abs(n) >= 1e6:  return f"{n/1e6:.1f}M{suffix}"
     if abs(n) >= 1e3:  return f"{n/1e3:.0f}K{suffix}"
     return f"{n:,.1f}{suffix}"
+
+def safe_df(df):
+    """Chuẩn hóa DataFrame để st.dataframe/pyarrow không lỗi:
+    - tên cột về string + dedup
+    - mọi giá trị về string (tránh mixed-type)."""
+    if df is None or df.empty: return pd.DataFrame()
+    out = df.copy()
+    # Cột về string + dedup
+    seen={}; cols=[]
+    for c in out.columns:
+        c=str(c)
+        if c in seen: seen[c]+=1; cols.append(f"{c}.{seen[c]}")
+        else: seen[c]=0; cols.append(c)
+    out.columns=cols
+    # Mọi ô về string an toàn
+    for c in out.columns:
+        out[c]=out[c].apply(lambda v: "" if v is None or (isinstance(v,float) and math.isnan(v))
+                            else (f"{v:,.2f}" if isinstance(v,float) else str(v)))
+    return out
+
 
 def _safe(row, *keys):
     """Lấy giá trị từ row theo nhiều tên cột có thể có."""
@@ -931,16 +963,31 @@ with tab2:
         for fig_f in build_fin_charts(rat_df,inc_df):
             st.plotly_chart(fig_f,use_container_width=True)
         items_f,total_f=score_fundamental(rat_df, inc_df)
-        eps_row = rat_df[rat_df['item_id'].isin(['earnings_per_share','eps'])] if not rat_df.empty else pd.DataFrame()
-        eps_yc = ryc2 if ryc2 else iyc2
-        if not eps_row.empty and eps_yc:
-            eps_vals = pd.to_numeric(eps_row[eps_yc].values[0], errors='coerce')
-            growth_df = pd.DataFrame({'Năm': eps_yc, 'EPS (đ)': eps_vals})
+        # Bảng tăng trưởng EPS — hỗ trợ cả LONG (item_id) lẫn WIDE (cột)
+        eps_years=[]; eps_series=[]
+        if not rat_df.empty and 'item_id' not in rat_df.columns:
+            # WIDE (VCI): EPS là 1 cột
+            eps_col=next((c for c in ['earnings_per_share','eps','earningPerShare'] if c in rat_df.columns), None)
+            yc_w=next((c for c in rat_df.columns if 'year' in str(c).lower()), None)
+            if eps_col and yc_w:
+                eps_series=pd.to_numeric(rat_df[eps_col],errors='coerce').tolist()
+                eps_years=[str(int(v)) if pd.notna(v) else "" for v in rat_df[yc_w]]
+        else:
+            # LONG (KBS): EPS ở item_id, năm là cột
+            src_df = rat_df if (not rat_df.empty and 'item_id' in rat_df.columns) else inc_df
+            yc_l = ryc2 if (not rat_df.empty and 'item_id' in rat_df.columns and ryc2) else iyc2
+            if src_df is not None and not src_df.empty and 'item_id' in src_df.columns and yc_l:
+                eps_row = src_df[src_df['item_id'].isin(['earnings_per_share','eps','basic_eps'])]
+                if not eps_row.empty:
+                    eps_series=pd.to_numeric(eps_row[yc_l].values[0],errors='coerce').tolist()
+                    eps_years=list(yc_l)
+        if eps_years and eps_series:
+            growth_df = pd.DataFrame({'Năm': eps_years, 'EPS (đ)': eps_series})
             growth_df['Tăng trưởng'] = growth_df['EPS (đ)'].pct_change() * 100
             growth_df['Tăng trưởng'] = growth_df['Tăng trưởng'].apply(lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
             growth_df['EPS (đ)'] = growth_df['EPS (đ)'].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
             st.markdown("### 📈 Tăng trưởng EPS theo năm")
-            st.dataframe(growth_df, use_container_width=True, hide_index=True)
+            st.dataframe(safe_df(growth_df), use_container_width=True, hide_index=True)
         if items_f:
             st.markdown("### ✅ Chấm điểm cơ bản")
             chip_cols=st.columns(len(items_f))
@@ -955,8 +1002,8 @@ with tab2:
               <div style='font-size:11px;color:#6a9cc8;'>Ngưỡng: ≥3 điểm = cơ bản tốt để cân nhắc mua</div>
             </div>""",unsafe_allow_html=True)
         with st.expander("📋 Bảng chỉ số đầy đủ theo năm"):
-            disp=[c for c in rat_df.columns if c not in ["ticker","id"]]
-            st.dataframe(rat_df[disp].reset_index(drop=True),use_container_width=True,hide_index=True)
+            disp=[c for c in rat_df.columns if str(c) not in ["ticker","id"]]
+            st.dataframe(safe_df(rat_df[disp]),use_container_width=True,hide_index=True)
     else:
         st.warning(f"Không lấy được dữ liệu tài chính. {ratio_src}\n\nThử mã khác hoặc kiểm tra kết nối.")
         st.info("💡 Gợi ý: Thử lại sau vài giây. KBS API đôi khi cần warm-up request đầu tiên.")
@@ -1192,7 +1239,7 @@ with tab6:
             st.markdown("#### 🎯 Price Targets")
             ptdf=pd.DataFrame(tcbs_pt[:5])
             dcols=[c for c in ['firm','targetPrice','priceTarget','action','date'] if c in ptdf.columns]
-            if dcols: st.dataframe(ptdf[dcols],use_container_width=True,hide_index=True)
+            if dcols: st.dataframe(safe_df(ptdf[dcols]),use_container_width=True,hide_index=True)
         if tcbs_ov:
             mc=tcbs_ov.get('marketCap',tcbs_ov.get('capitalization'))
             if mc: st.metric("Vốn hóa (TCBS)",fmt(mc))
