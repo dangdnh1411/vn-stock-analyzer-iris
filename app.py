@@ -334,19 +334,47 @@ def fetch_vci_news(sym):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def scan_stock_quick(sym, days=90):
-    try:
-        df2=fetch_price(sym,days,"1D")
-        if len(df2)<30: return None
-        df2i=add_indicators(df2)
-        s2,_,sc2=calc_signal(df2i)
-        lat2=df2i.iloc[-1]
-        chg1d=(float(lat2.Close)-float(df2i.iloc[-2].Close))/float(df2i.iloc[-2].Close)*100 if len(df2i)>1 else 0
-        chg5d=(float(lat2.Close)-float(df2i.iloc[-5].Close))/float(df2i.iloc[-5].Close)*100 if len(df2i)>5 else 0
-        return dict(sym=sym,sig=s2,score=sc2,close=float(lat2.Close),
-                    chg1d=chg1d,chg5d=chg5d,rsi=float(lat2.RSI),
-                    adx=float(lat2.ADX) if pd.notna(lat2.ADX) else 0,
-                    vol_ratio=float(lat2.Vol_Ratio))
-    except: return None
+    """Lấy giá + chỉ báo kỹ thuật cho 1 mã. KBS → yfinance fallback."""
+    for source in ["KBS", "yf"]:
+        try:
+            if source == "KBS":
+                from vnstock import Quote
+                end = (datetime.now()).strftime("%Y-%m-%d")
+                start = (datetime.now()-timedelta(days=days)).strftime("%Y-%m-%d")
+                raw = Quote(symbol=sym.upper(), source="KBS").history(
+                    start=start, end=end, interval="1D")
+                if raw is None or raw.empty: continue
+                raw = raw.rename(columns={"time":"Date","open":"Open","high":"High",
+                                          "low":"Low","close":"Close","volume":"Volume"})
+                for c in ["Open","High","Low","Close"]:
+                    raw[c] = pd.to_numeric(raw[c], errors="coerce")
+                    if raw[c].median() < 1000: raw[c] *= 1000
+                raw["Volume"] = pd.to_numeric(raw["Volume"], errors="coerce").fillna(0).astype(int)
+                raw["Date"] = pd.to_datetime(raw["Date"])
+                df2 = raw.sort_values("Date").reset_index(drop=True)
+            else:
+                import yfinance as yf
+                df2 = yf.download(f"{sym}.VN", period=f"{days}d",
+                                  interval="1d", progress=False, auto_adjust=True)
+                if df2.empty: continue
+                df2 = df2.reset_index()
+                df2.columns = [c[0] if isinstance(c,tuple) else c for c in df2.columns]
+                df2 = df2.rename(columns={"Date":"Date","Open":"Open","High":"High",
+                                          "Low":"Low","Close":"Close","Volume":"Volume"})
+            if df2 is None or len(df2) < 30: continue
+            df2i = add_indicators(df2)
+            s2, _, sc2 = calc_signal(df2i)
+            lat2 = df2i.iloc[-1]
+            chg1d = (float(lat2.Close)-float(df2i.iloc[-2].Close))/float(df2i.iloc[-2].Close)*100 if len(df2i)>1 else 0
+            chg5d = (float(lat2.Close)-float(df2i.iloc[-5].Close))/float(df2i.iloc[-5].Close)*100 if len(df2i)>5 else 0
+            cmf = float(lat2.CMF) if "CMF" in df2i.columns and pd.notna(lat2.CMF) else 0.0
+            return dict(sym=sym, sig=s2, score=sc2, close=float(lat2.Close),
+                        chg1d=chg1d, chg5d=chg5d, rsi=float(lat2.RSI),
+                        adx=float(lat2.ADX) if pd.notna(lat2.ADX) else 0,
+                        vol_ratio=float(lat2.Vol_Ratio), cmf=cmf)
+        except Exception:
+            continue
+    return None
 
 def fmt(n, suffix=""):
     if n is None or (isinstance(n, float) and math.isnan(n)): return "—"
@@ -1093,7 +1121,9 @@ with tab4:
         for ii,sym2 in enumerate(cmp_syms):
             prog.progress((ii+1)/len(cmp_syms),f"Tải {sym2}...")
             try:
-                df2=fetch_price(sym2,180,"1D"); rat2=fetch_ratio(sym2)[0]; inc2=fetch_income(sym2)
+                _r2 = fetch_price(sym2, 180, "1D")
+                df2 = _r2[0] if isinstance(_r2, tuple) else _r2
+                rat2=fetch_ratio(sym2)[0]; inc2=fetch_income(sym2)
                 ryc2t=_ycols(rat2); rl2t=ryc2t[-1] if ryc2t else None
                 iyc2t=_ycols(inc2); il2t=iyc2t[-1] if iyc2t else None
                 def gv2(iid): return _sg(iid,(rat2,rl2t),(inc2,il2t))
@@ -1116,6 +1146,8 @@ with tab4:
         n_ok=sum(1 for r in cmp_data if r["Giá"]!="—")
         st.caption(f"Tải xong: {n_ok}/{len(cmp_data)} mã có dữ liệu")
         st.dataframe(pd.DataFrame(cmp_data),use_container_width=True,hide_index=True)
+
+        # ── Biểu đồ P/E ──
         valid=[(r["Mã"],float(r["P/E"].replace("x","").replace("—","0"))) for r in cmp_data if r["P/E"]!="—" and "x" in str(r["P/E"])]
         if valid:
             mcs2,pes2=zip(*[(m,v) for m,v in valid if v>0])
@@ -1124,10 +1156,79 @@ with tab4:
                 text=[f"{v:.1f}x" for v in pes2],textposition="outside"))
             if SECTOR_PE.get(cur_sec):
                 fpE.add_hline(y=SECTOR_PE[cur_sec],line=dict(color="#f5a623",dash="dot",width=1.5),
-                    annotation_text=f" Median {SECTOR_PE[cur_sec]}x",annotation_font=dict(color="#f5a623",size=10))
-            fpE.update_layout(height=260,title="So sánh P/E",template="plotly_dark",**CHART_STYLE)
+                    annotation_text=f" Median ngành {SECTOR_PE[cur_sec]}x",annotation_font=dict(color="#f5a623",size=10))
+            fpE.update_layout(height=260,title="So sánh P/E toàn ngành",template="plotly_dark",**CHART_STYLE)
             fpE.layout.title.font.color="#8baed4"
             st.plotly_chart(fpE,use_container_width=True)
+
+        # ── Phân tích & nhận xét ──
+        st.markdown("### 🔬 Phân tích & nhận xét ngành")
+        valid_data = [r for r in cmp_data if r["Giá"]!="—"]
+        if valid_data:
+            # Tìm mã tốt nhất theo từng tiêu chí
+            def parse_num(s, strip="x%"):
+                try: return float(str(s).replace("x","").replace("%","").replace(",","").replace("—",""))
+                except: return None
+
+            # Định giá rẻ nhất (P/E thấp nhất > 0)
+            pe_list = [(r["Mã"], parse_num(r["P/E"])) for r in valid_data if parse_num(r["P/E"]) and parse_num(r["P/E"])>0]
+            roe_list = [(r["Mã"], parse_num(r["ROE"])) for r in valid_data if parse_num(r["ROE"])]
+            score_list = [(r["Mã"], r["Score"]) for r in valid_data if isinstance(r["Score"], (int,float))]
+            perf_1m = [(r["Mã"], parse_num(r["+1T"])) for r in valid_data if parse_num(r["+1T"])]
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if pe_list:
+                    cheapest = min(pe_list, key=lambda x:x[1])
+                    most_exp = max(pe_list, key=lambda x:x[1])
+                    med_pe = SECTOR_PE.get(cur_sec)
+                    sym_pe = next((parse_num(r["P/E"]) for r in valid_data if r["Mã"]==symbol), None)
+                    vs_txt = ""
+                    if sym_pe and med_pe:
+                        diff = (sym_pe-med_pe)/med_pe*100
+                        vs_txt = f"{'đắt hơn' if diff>0 else 'rẻ hơn'} median ngành **{abs(diff):.0f}%**"
+                    st.markdown(f"""**📊 Định giá (P/E)**
+- Rẻ nhất: **{cheapest[0]}** ({cheapest[1]:.1f}x)
+- Đắt nhất: **{most_exp[0]}** ({most_exp[1]:.1f}x)
+- **{symbol}** đang {vs_txt if vs_txt else f'P/E={sym_pe:.1f}x' if sym_pe else '—'}
+- Median ngành: {med_pe}x""")
+
+                if roe_list:
+                    best_roe = max(roe_list, key=lambda x:x[1])
+                    sym_roe = next((v for m,v in roe_list if m==symbol), None)
+                    st.markdown(f"""**💰 Sinh lời (ROE)**
+- Cao nhất: **{best_roe[0]}** ({best_roe[1]:.1f}%)
+- **{symbol}**: {f'{sym_roe:.1f}%' if sym_roe else '—'}
+- {'✅ Trên trung bình ngành' if sym_roe and sym_roe > sum(v for _,v in roe_list)/len(roe_list) else '⚠️ Dưới trung bình ngành' if sym_roe else ''}""")
+
+            with col_b:
+                if score_list:
+                    best_kt = max(score_list, key=lambda x:x[1])
+                    sym_kt = next((v for m,v in score_list if m==symbol), None)
+                    st.markdown(f"""**📉 Kỹ thuật (Score)**
+- Tín hiệu mạnh nhất: **{best_kt[0]}** ({best_kt[1]:+.1f})
+- **{symbol}**: {f'{sym_kt:+.1f}' if sym_kt is not None else '—'}""")
+
+                if perf_1m:
+                    best_1m = max(perf_1m, key=lambda x:x[1])
+                    worst_1m = min(perf_1m, key=lambda x:x[1])
+                    sym_1m = next((v for m,v in perf_1m if m==symbol), None)
+                    st.markdown(f"""**🚀 Hiệu suất 1 tháng**
+- Tăng mạnh nhất: **{best_1m[0]}** ({best_1m[1]:+.1f}%)
+- Giảm mạnh nhất: **{worst_1m[0]}** ({worst_1m[1]:+.1f}%)
+- **{symbol}**: {f'{sym_1m:+.1f}%' if sym_1m is not None else '—'}""")
+
+            # Tổng kết vị thế của mã đang xem
+            st.markdown("---")
+            rank_score = sorted(score_list, key=lambda x:x[1], reverse=True)
+            rank_pos = next((i+1 for i,(m,_) in enumerate(rank_score) if m==symbol), None)
+            rank_pe   = sorted(pe_list, key=lambda x:x[1]) if pe_list else []
+            rank_pe_pos = next((i+1 for i,(m,_) in enumerate(rank_pe) if m==symbol), None)
+            st.markdown(f"**🏆 Vị thế {symbol} trong ngành {cur_sec}:**")
+            notes=[]
+            if rank_pos: notes.append(f"Kỹ thuật: **#{rank_pos}/{len(rank_score)}** trong ngành")
+            if rank_pe_pos: notes.append(f"Định giá rẻ: **#{rank_pe_pos}/{len(rank_pe)}** (1=rẻ nhất)")
+            for n in notes: st.markdown(f"  - {n}")
     else:
         st.info("Nhấn **Tải dữ liệu so sánh** để xem peer comparison.")
 
@@ -1162,25 +1263,81 @@ with tab5:
         st.session_state.scan_key=scan_sec
     results=st.session_state.scan_results
     if results and st.session_state.scan_key==scan_sec:
-        st.markdown(f"#### Top 5 mã tiềm năng — {scan_sec}")
-        for rank,r2 in enumerate(results[:5],1):
+        def composite(r2):
+            s=r2['score']
+            if 35<=r2['rsi']<=65: s+=1
+            if r2['adx']>20: s+=0.5
+            if r2['vol_ratio']>1.2: s+=0.7
+            if r2.get('cmf',0)>0.05: s+=0.5
+            return s
+
+        top5=results[:5]
+        st.markdown(f"#### 🌟 Top 5 tiềm năng — {scan_sec} ({datetime.now().strftime('%d/%m %H:%M')})")
+        for rank,r2 in enumerate(top5,1):
             clr=SIG_COLOR.get(r2['sig'],"#8baed4")
             chg_clr="#00d97e" if r2['chg1d']>=0 else "#ff3d5a"
-            rank_str=f"# {rank}"
+            # Lý do vào danh sách
+            why=[]
+            if 40<=r2['rsi']<=62: why.append(f"RSI={r2['rsi']:.0f} vùng tốt")
+            elif r2['rsi']<35: why.append(f"RSI={r2['rsi']:.0f} quá bán")
+            if r2['adx']>25: why.append(f"ADX={r2['adx']:.0f} xu hướng mạnh")
+            if r2['vol_ratio']>1.3: why.append(f"Vol×{r2['vol_ratio']:.1f} đột biến")
+            if r2.get('cmf',0)>0.05: why.append("CMF+ dòng tiền vào")
+            if r2['score']>=2.5: why.append("Kỹ thuật mạnh")
+            why_str=" · ".join(why) if why else "Tổng hợp chỉ báo"
+            rank_str=f"#{rank}"
             st.markdown(
-                f"<div style='background:#0c1d2e;border:1px solid #163350;border-left:3px solid {clr};"
-                f"border-radius:0 12px 12px 0;padding:12px 16px;margin:6px 0;"
-                f"display:flex;align-items:center;gap:16px;flex-wrap:wrap;'>"
-                f"<b style='font-size:18px;color:#6a9cc8;'>{rank_str}</b>"
+                f"<div style='background:#0c1d2e;border:1px solid #163350;border-left:4px solid {clr};"
+                f"border-radius:0 12px 12px 0;padding:13px 16px;margin:6px 0;'>"
+                f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
+                f"<b style='font-size:20px;color:#6a9cc8;min-width:28px;'>{rank_str}</b>"
                 f"<span style='font-size:20px;font-weight:700;color:#fff;'>{r2['sym']}</span>"
-                f"<span style='color:{clr};font-weight:600;'>{r2['sig']} ({r2['score']:+.1f})</span>"
-                f"<span style='color:#fff;'>{r2['close']:,.0f}đ</span>"
-                f"<span style='color:{chg_clr};'>{r2['chg1d']:+.2f}%</span>"
-                f"<span style='color:#6a9cc8;font-size:12px;'>RSI {r2['rsi']:.0f} ADX {r2['adx']:.0f}</span>"
+                f"<span style='background:{clr}22;color:{clr};padding:2px 10px;border-radius:12px;font-weight:600;font-size:13px;'>{r2['sig']}</span>"
+                f"<span style='color:#fff;font-size:15px;'>{r2['close']:,.0f}đ</span>"
+                f"<span style='color:{chg_clr};font-size:13px;'>{r2['chg1d']:+.2f}% hôm nay</span>"
+                f"</div>"
+                f"<div style='margin-top:6px;font-size:12px;color:#8baed4;'>"
+                f"Score <b style='color:{clr};'>{r2['score']:+.1f}</b> &nbsp;|&nbsp; "
+                f"RSI {r2['rsi']:.0f} &nbsp;|&nbsp; ADX {r2['adx']:.0f} &nbsp;|&nbsp; Vol×{r2['vol_ratio']:.1f}"
+                f"</div>"
+                f"<div style='margin-top:4px;font-size:12px;color:#22d3ee;'>💡 {why_str}</div>"
                 f"</div>", unsafe_allow_html=True)
-        with st.expander("📋 Toàn bộ kết quả"):
+
+        # Phân tích tổng quan toàn ngành
+        st.markdown("### 📊 Nhận xét tổng quan ngành")
+        buy_count = sum(1 for r in results if r['score']>=0.5)
+        sell_count = sum(1 for r in results if r['score']<-0.5)
+        neutral_count = len(results)-buy_count-sell_count
+        avg_rsi = sum(r['rsi'] for r in results)/len(results)
+        avg_adx = sum(r['adx'] for r in results)/len(results)
+
+        # Tín hiệu thị trường ngành
+        if buy_count > len(results)*0.6:
+            mkt_sig="🟢 Ngành đang **TÍCH CỰC** — đa số mã có tín hiệu mua"
+        elif sell_count > len(results)*0.5:
+            mkt_sig="🔴 Ngành đang **TIÊU CỰC** — đa số mã có áp lực bán"
+        else:
+            mkt_sig="⚠️ Ngành đang **PHÂN HÓA** — tín hiệu mua bán lẫn lộn"
+
+        col_x,col_y=st.columns(2)
+        with col_x:
+            st.markdown(f"""{mkt_sig}
+
+**Phân bổ tín hiệu ({len(results)} mã):**
+- 📈 Mua/Tích cực: **{buy_count}** mã ({buy_count/len(results)*100:.0f}%)
+- 📉 Bán/Tiêu cực: **{sell_count}** mã ({sell_count/len(results)*100:.0f}%)
+- ↔️ Trung tính: **{neutral_count}** mã""")
+        with col_y:
+            rsi_note = "vùng trung bình, chưa cực đoan" if 40<=avg_rsi<=65 else ("quá mua — cẩn thận" if avg_rsi>65 else "gần quá bán — có thể phục hồi")
+            adx_note = "xu hướng có đà" if avg_adx>25 else "xu hướng yếu, sideway"
+            st.markdown(f"""**Chỉ báo trung bình ngành:**
+- RSI TB: **{avg_rsi:.0f}** — {rsi_note}
+- ADX TB: **{avg_adx:.0f}** — {adx_note}
+- Mã đột biến volume: **{sum(1 for r in results if r['vol_ratio']>1.5)}** mã""")
+
+        with st.expander("📋 Toàn bộ kết quả quét"):
             tbl=[{"Mã":r2['sym'],"Giá":f"{r2['close']:,.0f}","1D":f"{r2['chg1d']:+.1f}%",
-                "5D":f"{r2['chg5d']:+.1f}%","Tín hiệu":r2['sig'],"Score":r2['score'],
+                "5D":f"{r2['chg5d']:+.1f}%","Tín hiệu":r2['sig'],"Score":f"{r2['score']:+.1f}",
                 "RSI":f"{r2['rsi']:.0f}","ADX":f"{r2['adx']:.0f}","Vol/TB":f"×{r2['vol_ratio']:.1f}"}
                 for r2 in results]
             st.dataframe(pd.DataFrame(tbl),use_container_width=True,hide_index=True)
