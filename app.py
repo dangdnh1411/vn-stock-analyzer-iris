@@ -121,34 +121,66 @@ def fetch_price(sym: str, days: int, interval: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ratio(sym: str):
-    """Lấy chỉ số tài chính từ KBS."""
+    """Chỉ số tài chính: VCI (có EPS đầy đủ) → KBS → trống.
+    VCI trả WIDE format (cột=chỉ số), KBS trả LONG format (item_id)."""
+    sym = sym.upper()
+    # Nguồn 1: VCI — có EPS, BVPS cho cả ngân hàng, format WIDE
     try:
         from vnstock import Finance
-        fin = Finance(symbol=sym.upper(), source="KBS")
+        fin = Finance(symbol=sym, source="VCI")
+        df = fin.ratio(period="year", lang="en", dropna=False)
+        if df is not None and not df.empty:
+            # Flatten MultiIndex nếu có
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = ['_'.join(str(x) for x in c if str(x)!='nan').strip('_')
+                              for c in df.columns]
+                # Bỏ prefix Meta_ / nhóm
+                df.columns = [c.split('_')[-1] if '_' in c else c for c in df.columns]
+            # Sort theo năm tăng dần
+            yc = next((c for c in df.columns if 'year' in str(c).lower()), None)
+            if yc: df = df.sort_values(yc).reset_index(drop=True)
+            return df, "VCI Finance ✅"
+    except Exception:
+        pass
+    # Nguồn 2: KBS (LONG format)
+    try:
+        from vnstock import Finance
+        fin = Finance(symbol=sym, source="KBS")
         df  = fin.ratio(period="year")
-        if df is None or df.empty: raise ValueError("Empty ratio")
-        # Sort mới nhất lên đầu
-        year_col = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
-        if year_col:
-            df = df.sort_values(year_col, ascending=False).reset_index(drop=True)
-        return df, "KBS Finance ✅"
-    except Exception as e:
-        return pd.DataFrame(), f"Lỗi: {e}"
+        if df is not None and not df.empty:
+            return df, "KBS Finance ✅"
+    except Exception:
+        pass
+    return pd.DataFrame(), "Không lấy được chỉ số"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_income(sym: str) -> pd.DataFrame:
-    """Lấy kết quả kinh doanh từ KBS."""
+    """KQKD: VCI (WIDE) → KBS (LONG)."""
+    sym = sym.upper()
     try:
         from vnstock import Finance
-        fin = Finance(symbol=sym.upper(), source="KBS")
+        fin = Finance(symbol=sym, source="VCI")
+        df = fin.income_statement(period="year", lang="en", dropna=False)
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = ['_'.join(str(x) for x in c if str(x)!='nan').strip('_') for c in df.columns]
+                df.columns = [c.split('_')[-1] if '_' in c else c for c in df.columns]
+            yc = next((c for c in df.columns if 'year' in str(c).lower()), None)
+            if yc: df = df.sort_values(yc).reset_index(drop=True)
+            return df
+    except Exception:
+        pass
+    try:
+        from vnstock import Finance
+        fin = Finance(symbol=sym, source="KBS")
         df  = fin.income_statement(period="year")
-        if df is None or df.empty: return pd.DataFrame()
-        year_col = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
-        if year_col:
-            df = df.sort_values(year_col, ascending=True).reset_index(drop=True)
-        return df
+        if df is not None and not df.empty:
+            yc = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
+            if yc: df = df.sort_values(yc, ascending=True).reset_index(drop=True)
+            return df
     except:
-        return pd.DataFrame()
+        pass
+    return pd.DataFrame()
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_foreign_trade(sym: str, days: int = 60) -> pd.DataFrame:
@@ -245,6 +277,47 @@ def fetch_news_ai(sym, sector=""):
             except: pass
     except: pass
     return {"news":[],"key_events":[]}
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_price_board(symbols):
+    """Lấy giá + thay đổi của nhiều mã trong 1 request (VCI). Cho screener/ngành."""
+    out = {}
+    try:
+        from vnstock import Trading
+        tb = Trading(source="VCI")
+        df = tb.price_board(symbols, flatten_columns=True)
+        if df is not None and not df.empty:
+            # Tìm cột symbol và giá
+            cols = {c.lower(): c for c in df.columns}
+            sym_c = next((cols[k] for k in cols if 'symbol' in k), None)
+            price_c = next((cols[k] for k in cols if 'match' in k and 'price' in k), None)
+            if not price_c:
+                price_c = next((cols[k] for k in cols if k.endswith('matchprice') or 'closeprice' in k or k=='match_match_price'), None)
+            ref_c = next((cols[k] for k in cols if 'refprice' in k or 'ref_price' in k), None)
+            for _, row in df.iterrows():
+                s = str(row[sym_c]).upper() if sym_c else None
+                if not s: continue
+                price = pd.to_numeric(row[price_c], errors='coerce') if price_c else None
+                ref = pd.to_numeric(row[ref_c], errors='coerce') if ref_c else None
+                chg = ((price-ref)/ref*100) if (price and ref and ref>0) else 0
+                out[s] = {'price': float(price) if pd.notna(price) else None,
+                          'chg': float(chg) if pd.notna(chg) else 0}
+    except Exception:
+        pass
+    return out
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_vci_news(sym):
+    """Tin tức từ VCI Company.news() — nguồn ổn định hơn TCBS trên cloud."""
+    try:
+        from vnstock.explorer.vci.company import Company
+        co = Company(symbol=sym.upper())
+        df = co.news()
+        if df is not None and not df.empty:
+            return df.head(12).to_dict("records")
+    except Exception:
+        pass
+    return []
 
 @st.cache_data(ttl=300, show_spinner=False)
 def scan_stock_quick(sym, days=90):
@@ -432,19 +505,20 @@ def calc_trade(df, score):
 # ══════════════════════════════ FUNDAMENTAL SCORING ════════════════════════════
 _META_COLS = ['item','item_id','item_en','unit','levels','row_number']
 _GV_ALIASES = {
-    'pe_ratio':           ['pe_ratio','p_e'],
-    'pb_ratio':           ['pb_ratio','p_b'],
+    'pe_ratio':           ['pe_ratio','p_e','pe'],
+    'pb_ratio':           ['pb_ratio','p_b','pb'],
     'roe':                ['roe'],
     'roa':                ['roa'],
-    'earnings_per_share': ['earnings_per_share','eps','basic_eps'],
-    'debt_to_equity':     ['debt_to_equity','debt_equity'],
-    'current_ratio':      ['current_ratio'],
-    'gross_margin':       ['gross_margin','gross_profit_margin'],
-    'net_margin':         ['net_margin','net_profit_margin'],
+    'earnings_per_share': ['earnings_per_share','eps','basic_eps','earningPerShare'],
+    'debt_to_equity':     ['debt_to_equity','debt_equity','debtToEquity'],
+    'current_ratio':      ['current_ratio','currentRatio'],
+    'gross_margin':       ['gross_margin','gross_profit_margin','grossMargin'],
+    'net_margin':         ['net_margin','net_profit_margin','afterTaxProfitMargin'],
     'equity_total_assets':['equity_total_assets','equity_deposits_from_custom'],
     'ldr':                ['outstanding_loans_customer_','outstanding_loans_customer_deposits'],
-    'revenue':            ['revenue','net_revenue'],
+    'revenue':            ['revenue','net_revenue','revenueGrowth'],
     'net_profit':         ['net_profit','net_profit_after_tax'],
+    'book_value_per_share':['book_value_per_share','bookValuePerShare','bvps'],
 }
 
 def _ycols(df):
@@ -453,14 +527,20 @@ def _ycols(df):
                    if c not in _META_COLS and bool(re.search(r'\d{4}', str(c)))])
 
 def _sg(iid, *dfs_yrs):
+    """Smart get — hiểu cả LONG (KBS: item_id+năm) lẫn WIDE (VCI: cột=chỉ số)."""
     for alias in _GV_ALIASES.get(iid, [iid]):
         for df, yr in dfs_yrs:
-            if df is None or df.empty or yr is None: continue
-            if 'item_id' not in df.columns: continue
-            row = df[df['item_id'] == alias]
-            if not row.empty:
-                v = pd.to_numeric(row[yr].values[0], errors='coerce')
-                if pd.notna(v): return float(v)
+            if df is None or df.empty: continue
+            # Format LONG (KBS): item_id + cột năm
+            if 'item_id' in df.columns and yr is not None:
+                row = df[df['item_id'] == alias]
+                if not row.empty:
+                    v = pd.to_numeric(row[yr].values[0], errors='coerce')
+                    if pd.notna(v): return float(v)
+            # Format WIDE (VCI): alias là tên cột, lấy giá trị năm mới nhất
+            elif alias in df.columns:
+                s = pd.to_numeric(df[alias], errors='coerce').dropna()
+                if not s.empty: return float(s.iloc[-1])
     return None
 
 def _pct(v): return v*100 if v is not None and abs(v)<2 else v
@@ -539,25 +619,55 @@ def build_price_chart(df, trade, show_n, ema_list):
     for ann in fig.layout.annotations: ann.font.color="#4a6080"; ann.font.size=10
     return fig
 
+def _year_labels(df):
+    """Nhãn năm cho trục X — cả LONG (cột năm) lẫn WIDE (cột yearReport)."""
+    if df is None or df.empty: return []
+    if 'item_id' in df.columns:
+        return _ycols(df)
+    yc = next((c for c in df.columns if 'year' in str(c).lower() or 'năm' in str(c).lower()), None)
+    if yc: return [str(int(v)) if pd.notna(v) else "" for v in df[yc]]
+    return []
+
 def build_fin_charts(rat_df, inc_df):
     charts=[]
+    is_wide_r = (not rat_df.empty) and ('item_id' not in rat_df.columns)
+    is_wide_i = (inc_df is not None and not inc_df.empty) and ('item_id' not in inc_df.columns)
     ryc=_ycols(rat_df); iyc=_ycols(inc_df) if inc_df is not None else []
-    if not ryc and not iyc: return charts
+    xr=_year_labels(rat_df); xi=_year_labels(inc_df)
+    if not xr and not xi: return charts
 
     def get_series(iid, prefer_inc=False):
+        inc_has = inc_df is not None and not inc_df.empty
+        use_inc_first = prefer_inc and inc_has
         for alias in _GV_ALIASES.get(iid,[iid]):
-            if not prefer_inc and not rat_df.empty and 'item_id' in rat_df.columns and ryc:
-                row=rat_df[rat_df['item_id']==alias]
-                if not row.empty: return pd.to_numeric(row[ryc].values[0],errors='coerce'),ryc
-            if inc_df is not None and not inc_df.empty and 'item_id' in inc_df.columns and iyc:
+            # Nếu ưu tiên inc nhưng inc rỗng → vẫn cho phép lấy từ rat
+            if (not use_inc_first):
+                if not rat_df.empty and 'item_id' in rat_df.columns and ryc:
+                    row=rat_df[rat_df['item_id']==alias]
+                    if not row.empty: return pd.to_numeric(row[ryc].values[0],errors='coerce'),ryc
+                if is_wide_r and alias in rat_df.columns:
+                    s=pd.to_numeric(rat_df[alias],errors='coerce').values
+                    if not np.all(np.isnan(s)): return s, xr
+            if inc_has and 'item_id' in inc_df.columns and iyc:
                 row=inc_df[inc_df['item_id']==alias]
                 if not row.empty: return pd.to_numeric(row[iyc].values[0],errors='coerce'),iyc
-        return None, ryc
+            if is_wide_i and alias in inc_df.columns:
+                s=pd.to_numeric(inc_df[alias],errors='coerce').values
+                if not np.all(np.isnan(s)): return s, xi
+            # Fallback cuối: nếu đã ưu tiên inc nhưng không có → thử rat
+            if use_inc_first:
+                if not rat_df.empty and 'item_id' in rat_df.columns and ryc:
+                    row=rat_df[rat_df['item_id']==alias]
+                    if not row.empty: return pd.to_numeric(row[ryc].values[0],errors='coerce'),ryc
+                if is_wide_r and alias in rat_df.columns:
+                    s=pd.to_numeric(rat_df[alias],errors='coerce').values
+                    if not np.all(np.isnan(s)): return s, xr
+        return None, (xr if xr else xi)
 
     eps_s,x_eps=get_series('earnings_per_share',prefer_inc=True)
-    roe_s,_=get_series('roe'); roa_s,_=get_series('roa')
+    roe_s,xroe=get_series('roe'); roa_s,_=get_series('roa')
     gm_s,_=get_series('gross_margin'); nm_s,_=get_series('net_margin')
-    year_cols=ryc if ryc else iyc; x=year_cols
+    year_cols=xr if xr else xi; x=xroe if xroe else year_cols
 
     def to_pct(arr):
         if arr is None: return None
@@ -951,6 +1061,8 @@ with tab4:
             except:
                 cmp_data.append({"Mã":sym2,"Giá":"—","+1T":"—","+3T":"—","P/E":"—","P/B":"—","ROE":"—","EPS":"—","KT":"—","Score":"—"})
         prog.empty()
+        n_ok=sum(1 for r in cmp_data if r["Giá"]!="—")
+        st.caption(f"Tải xong: {n_ok}/{len(cmp_syms)} mã có dữ liệu")
         if cmp_data:
             cdf=pd.DataFrame(cmp_data)
             st.dataframe(cdf,use_container_width=True,hide_index=True)
@@ -973,13 +1085,20 @@ with tab4:
 with tab5:
     st.markdown("### 🔍 Quét mã tiềm năng — Top 5 dấu hiệu tăng")
     scan_sec=st.selectbox("Quét ngành",list(SECTOR_PEERS.keys()),key="scan_sec")
+    st.caption("Quét dựa trên dữ liệu giá KBS từng mã. Nếu KBS chậm/lỗi với 1 mã, mã đó sẽ bị bỏ qua thay vì làm hỏng cả bảng.")
     if st.button("🚀 Bắt đầu quét"):
-        results=[]; prog2=st.progress(0); scan_peers=SECTOR_PEERS[scan_sec]
+        results=[]; failed=[]; prog2=st.progress(0); scan_peers=SECTOR_PEERS[scan_sec]
         for ii,sym2 in enumerate(scan_peers):
             prog2.progress((ii+1)/len(scan_peers),f"Quét {sym2}...")
-            r2=scan_stock_quick(sym2)
+            try:
+                r2=scan_stock_quick(sym2)
+            except Exception:
+                r2=None
             if r2: results.append(r2)
+            else: failed.append(sym2)
         prog2.empty()
+        st.caption(f"Quét xong: {len(results)}/{len(scan_peers)} mã có dữ liệu"
+                   + (f" · Bỏ qua: {', '.join(failed)}" if failed else ""))
         if results:
             def composite(r2):
                 s=r2['score']
@@ -1011,7 +1130,8 @@ with tab5:
                     for r2 in results]
                 st.dataframe(pd.DataFrame(tbl),use_container_width=True,hide_index=True)
         else:
-            st.warning("Không quét được. Kiểm tra kết nối.")
+            st.warning("Không mã nào trả về dữ liệu giá. KBS có thể đang giới hạn request hoặc "
+                       "Streamlit Cloud bị chặn. Thử lại sau 1-2 phút, hoặc đổi sang ngành khác.")
     else:
         st.info("Nhấn **Bắt đầu quét** để tìm mã tiềm năng.")
 
@@ -1019,14 +1139,14 @@ with tab5:
 with tab6:
     st.markdown(f"### 📰 Tin tức & Sự kiện — {symbol}")
     sym_sec_n=next((s for s,ps in SECTOR_PEERS.items() if symbol in ps),"")
+    load_news = st.button("🔄 Tải tin tức mới nhất", key="news_btn")
     cn1,cn2=st.columns([3,2])
     with cn1:
         st.markdown("#### 🔍 Tin tức AI (web search)")
-        if st.button("🔄 Tải tin tức",key="news_btn"):
-            with st.spinner("Đang tìm..."):
+        news_data={"news":[],"key_events":[]}
+        if load_news:
+            with st.spinner("AI đang tìm tin tức..."):
                 news_data=fetch_news_ai(symbol,sym_sec_n)
-        else:
-            news_data={"news":[],"key_events":[]}
         for item in news_data.get("news",[])[:8]:
             sent=item.get("sentiment","neutral")
             sc={"positive":"#00d97e","negative":"#ff3d5a"}.get(sent,"#8baed4")
@@ -1038,24 +1158,36 @@ with tab6:
                 f"<div style='font-size:14px;font-weight:600;color:#fff;margin:3px 0;'>{ico} {item.get('title','')}</div>"
                 f"<div style='font-size:12px;color:#8baed4;'>{item.get('summary','')}</div></div>",
                 unsafe_allow_html=True)
-        if not news_data.get("news"): st.info("Nhấn **Tải tin tức** để AI tìm kiếm.")
+        if load_news and not news_data.get("news"):
+            st.info("AI không tìm được tin (có thể API bị giới hạn). Xem mục TCBS/VCI bên phải.")
+        elif not load_news:
+            st.info("Nhấn **Tải tin tức mới nhất** để AI tìm kiếm.")
         if news_data.get("key_events"):
             st.markdown("#### 📌 Sự kiện quan trọng")
             for ev in news_data["key_events"]: st.markdown(f"- {ev}")
     with cn2:
-        st.markdown("#### 📡 TCBS Activity")
-        tcbs_news=fetch_tcbs_news(symbol)
-        if tcbs_news:
-            for item in tcbs_news[:8]:
-                title=str(item.get('title',item.get('name',item.get('content','—'))))[:80]
-                date_s=str(item.get('publishDate',item.get('date','')))[:10]
+        st.markdown("#### 📡 Tin từ sàn (VCI/TCBS)")
+        feed=[]
+        if load_news:
+            vci_n=fetch_vci_news(symbol)
+            for item in vci_n:
+                title=str(item.get('news_title',item.get('title',item.get('newsTitle','')))).strip()
+                date_s=str(item.get('public_date',item.get('publishDate',item.get('date',''))))[:10]
+                if title: feed.append((date_s,title[:90]))
+            if not feed:
+                for item in fetch_tcbs_news(symbol):
+                    title=str(item.get('title',item.get('name',item.get('content','')))).strip()
+                    date_s=str(item.get('publishDate',item.get('date','')))[:10]
+                    if title: feed.append((date_s,title[:90]))
+        if feed:
+            for date_s,title in feed[:10]:
                 st.markdown(f"<div style='background:#0c1d2e;border:1px solid #163350;"
                     f"border-radius:8px;padding:8px 12px;margin:4px 0;'>"
                     f"<div style='font-size:11px;color:#4a6080;'>{date_s}</div>"
                     f"<div style='font-size:13px;color:#cce0ff;'>{title}</div></div>",
                     unsafe_allow_html=True)
-        else:
-            st.info("Không có tin từ TCBS.")
+        elif load_news:
+            st.info("Không lấy được tin từ sàn (VCI/TCBS có thể bị chặn trên cloud).")
         if tcbs_pt:
             st.markdown("#### 🎯 Price Targets")
             ptdf=pd.DataFrame(tcbs_pt[:5])
