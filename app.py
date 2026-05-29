@@ -121,12 +121,9 @@ def fetch_price(sym: str, days: int, interval: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _flatten_vci_cols(df):
-    """Flatten MultiIndex columns của VCI, giữ TÊN ĐẦY ĐỦ field + đảm bảo duy nhất.
-    VCI MultiIndex: (nhóm, field) → lấy field (phần tử cuối tuple), KHÔNG cắt theo '_'."""
+    """Flatten MultiIndex columns của VCI, giữ TÊN ĐẦY ĐỦ field + đảm bảo duy nhất."""
     if isinstance(df.columns, pd.MultiIndex):
-        # Lấy phần tử CUỐI của mỗi tuple (tên field thật), bỏ phần nhóm
         df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
-    # Dedup: nếu trùng tên → thêm hậu tố .1, .2...
     seen = {}; new_cols = []
     for c in df.columns:
         c = str(c)
@@ -137,12 +134,20 @@ def _flatten_vci_cols(df):
     df.columns = new_cols
     return df
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_ratio(sym: str):
-    """Chỉ số tài chính: VCI (có EPS đầy đủ) → KBS → trống.
-    VCI trả WIDE format (cột=chỉ số), KBS trả LONG format (item_id)."""
+    """Chỉ số tài chính: KBS primary (có eps, earnings_per_share) → VCI fallback → trống."""
     sym = sym.upper()
-    # Nguồn 1: VCI — có EPS, BVPS cho cả ngân hàng, format WIDE
+    # Nguồn 1: KBS — item_id chuẩn hóa, có eps trong ratio
+    try:
+        from vnstock import Finance
+        fin = Finance(symbol=sym, source="KBS")
+        df = fin.ratio(period="year")
+        if df is not None and not df.empty:
+            return df, "KBS ✅"
+    except Exception:
+        pass
+    # Nguồn 2: VCI fallback
     try:
         from vnstock import Finance
         fin = Finance(symbol=sym, source="VCI")
@@ -152,24 +157,28 @@ def fetch_ratio(sym: str):
             yc = next((c for c in df.columns if 'year' in str(c).lower()), None)
             if yc:
                 df = df.sort_values(yc).reset_index(drop=True)
-            return df, "VCI Finance ✅"
-    except Exception:
-        pass
-    # Nguồn 2: KBS (LONG format)
-    try:
-        from vnstock import Finance
-        fin = Finance(symbol=sym, source="KBS")
-        df  = fin.ratio(period="year")
-        if df is not None and not df.empty:
-            return df, "KBS Finance ✅"
+            return df, "VCI ✅"
     except Exception:
         pass
     return pd.DataFrame(), "Không lấy được chỉ số"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_income(sym: str) -> pd.DataFrame:
-    """KQKD: VCI (WIDE) → KBS (LONG)."""
+    """KQKD: KBS primary (có eps item_id='eps') → VCI fallback."""
     sym = sym.upper()
+    # KBS income có 'eps' → normalized → item_id='eps'
+    try:
+        from vnstock import Finance
+        fin = Finance(symbol=sym, source="KBS")
+        df = fin.income_statement(period="year")
+        if df is not None and not df.empty:
+            yc = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
+            if yc:
+                df = df.sort_values(yc, ascending=True).reset_index(drop=True)
+            return df
+    except Exception:
+        pass
+    # VCI fallback
     try:
         from vnstock import Finance
         fin = Finance(symbol=sym, source="VCI")
@@ -182,14 +191,6 @@ def fetch_income(sym: str) -> pd.DataFrame:
             return df
     except Exception:
         pass
-    try:
-        from vnstock import Finance
-        fin = Finance(symbol=sym, source="KBS")
-        df  = fin.income_statement(period="year")
-        if df is not None and not df.empty:
-            yc = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
-            if yc: df = df.sort_values(yc, ascending=True).reset_index(drop=True)
-            return df
     except:
         pass
     return pd.DataFrame()
@@ -1086,7 +1087,8 @@ with tab4:
     peers=[p for p in SECTOR_PEERS[cur_sec] if p!=symbol]
     sel_peers=st.multiselect("Chọn mã so sánh",peers,default=peers[:4])
     cmp_syms=[symbol]+sel_peers
-    if st.button("🔄 Tải dữ liệu so sánh"):
+    if "cmp_data" not in st.session_state: st.session_state.cmp_data=[]
+    if st.button("🔄 Tải dữ liệu so sánh", key="load_cmp"):
         cmp_data=[]; prog=st.progress(0)
         for ii,sym2 in enumerate(cmp_syms):
             prog.progress((ii+1)/len(cmp_syms),f"Tải {sym2}...")
@@ -1108,23 +1110,24 @@ with tab4:
             except:
                 cmp_data.append({"Mã":sym2,"Giá":"—","+1T":"—","+3T":"—","P/E":"—","P/B":"—","ROE":"—","EPS":"—","KT":"—","Score":"—"})
         prog.empty()
+        st.session_state.cmp_data=cmp_data
+    cmp_data=st.session_state.cmp_data
+    if cmp_data:
         n_ok=sum(1 for r in cmp_data if r["Giá"]!="—")
-        st.caption(f"Tải xong: {n_ok}/{len(cmp_syms)} mã có dữ liệu")
-        if cmp_data:
-            cdf=pd.DataFrame(cmp_data)
-            st.dataframe(cdf,use_container_width=True,hide_index=True)
-            valid=[(r["Mã"],float(r["P/E"].replace("x","").replace("—","0"))) for r in cmp_data if r["P/E"]!="—" and "x" in str(r["P/E"])]
-            if valid:
-                mcs2,pes2=zip(*[(m,v) for m,v in valid if v>0])
-                fpE=go.Figure(go.Bar(x=list(mcs2),y=list(pes2),
-                    marker_color=["#4a9ef8" if m==symbol else "#163350" for m in mcs2],
-                    text=[f"{v:.1f}x" for v in pes2],textposition="outside"))
-                if SECTOR_PE.get(cur_sec):
-                    fpE.add_hline(y=SECTOR_PE[cur_sec],line=dict(color="#f5a623",dash="dot",width=1.5),
-                        annotation_text=f" Median {SECTOR_PE[cur_sec]}x",annotation_font=dict(color="#f5a623",size=10))
-                fpE.update_layout(height=260,title="So sánh P/E",template="plotly_dark",**CHART_STYLE)
-                fpE.layout.title.font.color="#8baed4"
-                st.plotly_chart(fpE,use_container_width=True)
+        st.caption(f"Tải xong: {n_ok}/{len(cmp_data)} mã có dữ liệu")
+        st.dataframe(pd.DataFrame(cmp_data),use_container_width=True,hide_index=True)
+        valid=[(r["Mã"],float(r["P/E"].replace("x","").replace("—","0"))) for r in cmp_data if r["P/E"]!="—" and "x" in str(r["P/E"])]
+        if valid:
+            mcs2,pes2=zip(*[(m,v) for m,v in valid if v>0])
+            fpE=go.Figure(go.Bar(x=list(mcs2),y=list(pes2),
+                marker_color=["#4a9ef8" if m==symbol else "#163350" for m in mcs2],
+                text=[f"{v:.1f}x" for v in pes2],textposition="outside"))
+            if SECTOR_PE.get(cur_sec):
+                fpE.add_hline(y=SECTOR_PE[cur_sec],line=dict(color="#f5a623",dash="dot",width=1.5),
+                    annotation_text=f" Median {SECTOR_PE[cur_sec]}x",annotation_font=dict(color="#f5a623",size=10))
+            fpE.update_layout(height=260,title="So sánh P/E",template="plotly_dark",**CHART_STYLE)
+            fpE.layout.title.font.color="#8baed4"
+            st.plotly_chart(fpE,use_container_width=True)
     else:
         st.info("Nhấn **Tải dữ liệu so sánh** để xem peer comparison.")
 
@@ -1132,8 +1135,10 @@ with tab4:
 with tab5:
     st.markdown("### 🔍 Quét mã tiềm năng — Top 5 dấu hiệu tăng")
     scan_sec=st.selectbox("Quét ngành",list(SECTOR_PEERS.keys()),key="scan_sec")
-    st.caption("Quét dựa trên dữ liệu giá KBS từng mã. Nếu KBS chậm/lỗi với 1 mã, mã đó sẽ bị bỏ qua thay vì làm hỏng cả bảng.")
-    if st.button("🚀 Bắt đầu quét"):
+    # session_state để giữ kết quả sau re-run
+    if "scan_results" not in st.session_state: st.session_state.scan_results=[]
+    if "scan_key" not in st.session_state: st.session_state.scan_key=""
+    if st.button("🚀 Bắt đầu quét", key="btn_scan"):
         results=[]; failed=[]; prog2=st.progress(0); scan_peers=SECTOR_PEERS[scan_sec]
         for ii,sym2 in enumerate(scan_peers):
             prog2.progress((ii+1)/len(scan_peers),f"Quét {sym2}...")
@@ -1146,40 +1151,40 @@ with tab5:
         prog2.empty()
         st.caption(f"Quét xong: {len(results)}/{len(scan_peers)} mã có dữ liệu"
                    + (f" · Bỏ qua: {', '.join(failed)}" if failed else ""))
-        if results:
-            def composite(r2):
-                s=r2['score']
-                if 35<=r2['rsi']<=65: s+=1
-                if r2['adx']>20: s+=0.5
-                if r2['vol_ratio']>1.2: s+=0.7
-                return s
-            results.sort(key=composite,reverse=True)
-            st.markdown("#### Top 5 mã tiềm năng")
-            for rank,r2 in enumerate(results[:5],1):
-                clr=SIG_COLOR.get(r2['sig'],"#8baed4")
-                chg_clr="#00d97e" if r2['chg1d']>=0 else "#ff3d5a"
-                rank_str=f"# {rank}"
-                st.markdown(
-                    f"<div style='background:#0c1d2e;border:1px solid #163350;border-left:3px solid {clr};"
-                    f"border-radius:0 12px 12px 0;padding:12px 16px;margin:6px 0;"
-                    f"display:flex;align-items:center;gap:16px;flex-wrap:wrap;'>"
-                    f"<b style='font-size:18px;color:#6a9cc8;'>{rank_str}</b>"
-                    f"<span style='font-size:20px;font-weight:700;color:#fff;'>{r2['sym']}</span>"
-                    f"<span style='color:{clr};font-weight:600;'>{r2['sig']} ({r2['score']:+.1f})</span>"
-                    f"<span style='color:#fff;'>{r2['close']:,.0f}đ</span>"
-                    f"<span style='color:{chg_clr};'>{r2['chg1d']:+.2f}%</span>"
-                    f"<span style='color:#6a9cc8;font-size:12px;'>RSI {r2['rsi']:.0f} ADX {r2['adx']:.0f}</span>"
-                    f"</div>", unsafe_allow_html=True)
-            with st.expander("📋 Toàn bộ kết quả"):
-                tbl=[{"Mã":r2['sym'],"Giá":f"{r2['close']:,.0f}","1D":f"{r2['chg1d']:+.1f}%",
-                    "5D":f"{r2['chg5d']:+.1f}%","Tín hiệu":r2['sig'],"Score":r2['score'],
-                    "RSI":f"{r2['rsi']:.0f}","ADX":f"{r2['adx']:.0f}","Vol/TB":f"×{r2['vol_ratio']:.1f}"}
-                    for r2 in results]
-                st.dataframe(pd.DataFrame(tbl),use_container_width=True,hide_index=True)
-        else:
-            st.warning("Không mã nào trả về dữ liệu giá. KBS có thể đang giới hạn request hoặc "
-                       "Streamlit Cloud bị chặn. Thử lại sau 1-2 phút, hoặc đổi sang ngành khác.")
-    else:
+        def composite(r2):
+            s=r2['score']
+            if 35<=r2['rsi']<=65: s+=1
+            if r2['adx']>20: s+=0.5
+            if r2['vol_ratio']>1.2: s+=0.7
+            return s
+        results.sort(key=composite,reverse=True)
+        st.session_state.scan_results=results
+        st.session_state.scan_key=scan_sec
+    results=st.session_state.scan_results
+    if results and st.session_state.scan_key==scan_sec:
+        st.markdown(f"#### Top 5 mã tiềm năng — {scan_sec}")
+        for rank,r2 in enumerate(results[:5],1):
+            clr=SIG_COLOR.get(r2['sig'],"#8baed4")
+            chg_clr="#00d97e" if r2['chg1d']>=0 else "#ff3d5a"
+            rank_str=f"# {rank}"
+            st.markdown(
+                f"<div style='background:#0c1d2e;border:1px solid #163350;border-left:3px solid {clr};"
+                f"border-radius:0 12px 12px 0;padding:12px 16px;margin:6px 0;"
+                f"display:flex;align-items:center;gap:16px;flex-wrap:wrap;'>"
+                f"<b style='font-size:18px;color:#6a9cc8;'>{rank_str}</b>"
+                f"<span style='font-size:20px;font-weight:700;color:#fff;'>{r2['sym']}</span>"
+                f"<span style='color:{clr};font-weight:600;'>{r2['sig']} ({r2['score']:+.1f})</span>"
+                f"<span style='color:#fff;'>{r2['close']:,.0f}đ</span>"
+                f"<span style='color:{chg_clr};'>{r2['chg1d']:+.2f}%</span>"
+                f"<span style='color:#6a9cc8;font-size:12px;'>RSI {r2['rsi']:.0f} ADX {r2['adx']:.0f}</span>"
+                f"</div>", unsafe_allow_html=True)
+        with st.expander("📋 Toàn bộ kết quả"):
+            tbl=[{"Mã":r2['sym'],"Giá":f"{r2['close']:,.0f}","1D":f"{r2['chg1d']:+.1f}%",
+                "5D":f"{r2['chg5d']:+.1f}%","Tín hiệu":r2['sig'],"Score":r2['score'],
+                "RSI":f"{r2['rsi']:.0f}","ADX":f"{r2['adx']:.0f}","Vol/TB":f"×{r2['vol_ratio']:.1f}"}
+                for r2 in results]
+            st.dataframe(pd.DataFrame(tbl),use_container_width=True,hide_index=True)
+    elif not results:
         st.info("Nhấn **Bắt đầu quét** để tìm mã tiềm năng.")
 
 # ── TAB 6: TIN TỨC ───────────────────────────────────────────────────────────
