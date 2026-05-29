@@ -195,18 +195,6 @@ def fetch_income(sym: str) -> pd.DataFrame:
         pass
     return pd.DataFrame()
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_foreign_trade(sym: str, days: int = 60) -> pd.DataFrame:
-    """Lấy giao dịch khối ngoại từ KBS trading module."""
-    try:
-        from vnstock.explorer.kbs.trading import Trading
-        t  = Trading(symbol=sym.upper())
-        end   = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        df = t.price_board() if hasattr(t, 'price_board') else pd.DataFrame()
-        return df if not df.empty else pd.DataFrame()
-    except:
-        return pd.DataFrame()
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_balance(sym):
@@ -781,33 +769,23 @@ def build_fin_charts(rat_df, inc_df):
 
 # ══════════════════════════════ UI COMPONENTS ══════════════════════════════════
 def signal_banner(sig, score):
-    clr = SIG_COLOR.get(sig, "#8baed4")
-    sc_clr = "#00d97e" if score>=2 else "#ff3d5a" if score<=-2 else "#f5a623"
-    pct = min(100, max(0, (score+7)/14*100))
-    # Gradient theo tín hiệu
-    if score >= 2.5:
-        grad = "linear-gradient(135deg,#00d97e,#00b369)"
-        shadow = "rgba(0,217,126,0.35)"
-    elif score <= -2.5:
-        grad = "linear-gradient(135deg,#ff4757,#cc1133)"
-        shadow = "rgba(255,71,87,0.35)"
-    else:
-        grad = "linear-gradient(135deg,#163350,#0c2540)"
-        shadow = "rgba(0,0,0,0)"
-    return f"""<div style='background:{grad};border-radius:10px;
-      padding:14px 18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;
-      margin:8px 0;box-shadow:0 4px 18px {shadow};'>
-  <div><div style='font-size:10px;color:rgba(255,255,255,.65);letter-spacing:1px;'>TÍN HIỆU KỸ THUẬT</div>
-       <div style='font-size:26px;font-weight:700;color:#fff;text-shadow:0 1px 6px rgba(0,0,0,.3);'>{sig}</div></div>
-  <div style='text-align:center;'><div style='font-size:10px;color:rgba(255,255,255,.65);'>ĐIỂM</div>
-       <div style='font-size:28px;font-weight:700;color:#fff;'>{score}</div></div>
-  <div style='flex:1;min-width:200px;'>
-    <div style='font-size:9px;color:rgba(255,255,255,.5);letter-spacing:1px;margin-bottom:4px;'>BÁN MẠNH ←─────────→ MUA MẠNH</div>
-    <div style='height:8px;background:rgba(0,0,0,.25);border-radius:4px;overflow:hidden;'>
-      <div style='height:100%;width:{pct}%;background:rgba(255,255,255,.7);border-radius:4px;'></div>
-    </div>
-  </div>
-</div>"""
+    clr=SIG_COLOR.get(sig,"#8baed4"); sc_clr="#00d97e" if score>=2 else "#ff3d5a" if score<=-2 else "#f5a623"
+    pct=min(100,max(0,(score+7)/14*100))
+    if score>=2.5:   grad="linear-gradient(135deg,#00d97e,#00b369)"; shadow="rgba(0,217,126,0.35)"
+    elif score<=-2.5: grad="linear-gradient(135deg,#ff4757,#cc1133)"; shadow="rgba(255,71,87,0.35)"
+    else:             grad="linear-gradient(135deg,#163350,#0c2540)"; shadow="rgba(0,0,0,0)"
+    return (f"<div style='background:{grad};border-radius:10px;padding:14px 18px;"
+            f"display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin:8px 0;"
+            f"box-shadow:0 4px 18px {shadow};'>"
+            f"<div><div style='font-size:10px;color:rgba(255,255,255,.65);letter-spacing:1px;'>TÍN HIỆU KỸ THUẬT</div>"
+            f"<div style='font-size:26px;font-weight:700;color:#fff;text-shadow:0 1px 6px rgba(0,0,0,.3);'>{sig}</div></div>"
+            f"<div style='text-align:center;'><div style='font-size:10px;color:rgba(255,255,255,.65);'>ĐIỂM</div>"
+            f"<div style='font-size:28px;font-weight:700;color:#fff;'>{score}</div></div>"
+            f"<div style='flex:1;min-width:200px;'>"
+            f"<div style='font-size:9px;color:rgba(255,255,255,.5);letter-spacing:1px;margin-bottom:4px;'>BÁN MẠNH ←─────────→ MUA MẠNH</div>"
+            f"<div style='height:8px;background:rgba(0,0,0,.25);border-radius:4px;overflow:hidden;'>"
+            f"<div style='height:100%;width:{pct}%;background:rgba(255,255,255,.7);border-radius:4px;'></div>"
+            f"</div></div></div>")
 
 def trade_card_html(icon, title, val, sub, border):
     return f"""<div style='background:#0c1d2e;border:1px solid {border};border-radius:9px;padding:11px 13px;'>
@@ -863,11 +841,6 @@ with st.sidebar:
              "EMA50":c1.checkbox("EMA 50",True),"EMA200":c2.checkbox("EMA 200",False)}
     ema_list=[k for k,v in ema_sel.items() if v]
     run=st.button("🚀 Phân tích ngay",use_container_width=True)
-    if st.button("🗑️ Xóa cache",use_container_width=True,help="Xóa dữ liệu cũ, tải lại mới nhất"):
-        st.cache_data.clear()
-        for k in ["scan_results","scan_key","cmp_data"]:
-            if k in st.session_state: del st.session_state[k]
-        st.rerun()
     auto_r=st.checkbox("Tự động refresh",value=False)
     if auto_r: ref_sec=st.select_slider("Tần suất (giây)",[30,60,120,300],value=60)
     st.markdown("---")
@@ -878,11 +851,17 @@ with st.sidebar:
         if qcols[i%3].button(m,key=f"q_{m}",use_container_width=True): clicked=m
     if clicked: symbol=clicked
 
+# ── Tracking: nhớ symbol đã được phân tích ──────────────
+if run or clicked:
+    st.session_state['_sym_analysed'] = symbol
+
 # ══════════════════════════════ MAIN ══════════════════════════════════════════
 st.markdown(f"## {symbol} &nbsp;<span style='font-size:13px;color:#4a9ef8;'>{res_label} · {per_label}</span>",
             unsafe_allow_html=True)
 
-if not (run or auto_r or clicked):
+# Cho phép tab buttons hoạt động mà không reset về màn hình chính
+_already_run = st.session_state.get('_sym_analysed') == symbol
+if not (run or auto_r or clicked or _already_run):
     st.markdown("""<div style='text-align:center;padding:80px 20px;background:#0c1d2e;
       border-radius:12px;border:1px solid #163350;'>
       <div style='font-size:48px;'>📈</div>
@@ -1274,20 +1253,13 @@ with tab5:
             if 35<=r2['rsi']<=65: s+=1
             if r2['adx']>20: s+=0.5
             if r2['vol_ratio']>1.2: s+=0.7
+            if r2.get('cmf',0)>0.05: s+=0.5
             return s
         results.sort(key=composite,reverse=True)
         st.session_state.scan_results=results
         st.session_state.scan_key=scan_sec
     results=st.session_state.scan_results
     if results and st.session_state.scan_key==scan_sec:
-        def composite(r2):
-            s=r2['score']
-            if 35<=r2['rsi']<=65: s+=1
-            if r2['adx']>20: s+=0.5
-            if r2['vol_ratio']>1.2: s+=0.7
-            if r2.get('cmf',0)>0.05: s+=0.5
-            return s
-
         top5=results[:5]
         st.markdown(f"#### 🌟 Top 5 tiềm năng — {scan_sec} ({datetime.now().strftime('%d/%m %H:%M')})")
         for rank,r2 in enumerate(top5,1):
