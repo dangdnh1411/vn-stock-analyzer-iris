@@ -79,6 +79,17 @@ CHART_STYLE = dict(
 )
 
 # ══════════════════════════════ DATA LAYER (vnstock KBS) ══════════════════════
+def _dedupe_dates(df):
+    """Khử ngày trùng lặp trong dữ liệu giá.
+    Nguồn dữ liệu hay trả thêm dòng ở ngày GDKHQ (chia cổ tức/cổ phiếu thưởng) hoặc
+    ngày điều chỉnh giá → trùng ngày → mọi phép concat/reindex sau đó sẽ ValueError."""
+    if df is None or df.empty or "Date" not in df.columns: return df
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"])
+    if out["Date"].duplicated().any():
+        out = out.sort_values("Date").drop_duplicates(subset="Date", keep="last")
+    return out.reset_index(drop=True)
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_price(sym: str, days: int, interval: str):
     """Lấy dữ liệu giá từ KBS. Trả về (df, source_note)."""
@@ -101,7 +112,7 @@ def fetch_price(sym: str, days: int, interval: str):
         df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
         df["Date"]   = pd.to_datetime(df["Date"])
         df = df.sort_values("Date").reset_index(drop=True)
-        return df[["Date","Open","High","Low","Close","Volume"]], "KBS (KB Securities) ✅"
+        return _dedupe_dates(df[["Date","Open","High","Low","Close","Volume"]]), "KBS (KB Securities) ✅"
     except Exception as e1:
         # Fallback yfinance
         try:
@@ -115,7 +126,7 @@ def fetch_price(sym: str, days: int, interval: str):
             for col in ["Open","High","Low","Close"]: df[col]=pd.to_numeric(df[col],errors="coerce")
             df["Volume"]=pd.to_numeric(df["Volume"],errors="coerce").fillna(0).astype(int)
             df=df.sort_values("Date").reset_index(drop=True)
-            return df[["Date","Open","High","Low","Close","Volume"]], "Yahoo Finance ⚠️"
+            return _dedupe_dates(df[["Date","Open","High","Low","Close","Volume"]]), "Yahoo Finance ⚠️"
         except Exception as e2:
             raise RuntimeError(f"KBS: {e1} | Yahoo: {e2}")
 
@@ -141,7 +152,7 @@ def fetch_vnindex(days: int):
             df["Date"] = pd.to_datetime(df["Date"])
             df = df.sort_values("Date").reset_index(drop=True)
             if df["Close"].isna().all() or len(df) < 5: continue
-            return df[["Date", "Open", "High", "Low", "Close", "Volume"]], f"{src} ({sym_try}) ✅"
+            return _dedupe_dates(df[["Date", "Open", "High", "Low", "Close", "Volume"]]), f"{src} ({sym_try}) ✅"
         except Exception:
             continue
     return pd.DataFrame(), "Không lấy được VN-Index — kiểm tra lại mã index trên vnstock"
@@ -730,9 +741,18 @@ def calc_relative_strength(stock_df, index_df):
     Trả về (rs_series căn theo Date của stock_df, nhãn xu hướng RS)."""
     if index_df is None or index_df.empty or stock_df.empty:
         return None, "Không có dữ liệu VN-Index để so sánh"
-    s=stock_df.set_index("Date")["Close"].astype(float)
-    idx=index_df.set_index("Date")["Close"].astype(float)
-    merged=pd.concat([s,idx],axis=1,join="inner"); merged.columns=["stock","index"]
+    # Hàng phòng thủ: khử trùng ngày lần nữa phòng khi dữ liệu đến từ nguồn khác
+    _s=stock_df[["Date","Close"]].copy(); _i=index_df[["Date","Close"]].copy()
+    _s["Date"]=pd.to_datetime(_s["Date"]); _i["Date"]=pd.to_datetime(_i["Date"])
+    _s=_s.drop_duplicates(subset="Date",keep="last")
+    _i=_i.drop_duplicates(subset="Date",keep="last")
+    s=_s.set_index("Date")["Close"].astype(float)
+    idx=_i.set_index("Date")["Close"].astype(float)
+    try:
+        merged=pd.concat([s,idx],axis=1,join="inner")
+    except ValueError:
+        return None, "Dữ liệu ngày bị trùng lặp — không tính được RS"
+    merged.columns=["stock","index"]
     if merged.empty or len(merged)<10:
         return None, "Không đủ dữ liệu trùng khớp để tính RS"
     rs=(merged["stock"]/merged["stock"].iloc[0])/(merged["index"]/merged["index"].iloc[0])*100
@@ -1455,7 +1475,12 @@ def historical_var(daily_returns: pd.Series, conf: float = 0.95):
 
 def portfolio_beta(port_returns: pd.Series, bench_returns: pd.Series):
     if port_returns is None or bench_returns is None: return None
-    merged = pd.concat([port_returns, bench_returns], axis=1, join="inner").dropna()
+    try:
+        _p = port_returns[~port_returns.index.duplicated(keep="last")]
+        _b = bench_returns[~bench_returns.index.duplicated(keep="last")]
+        merged = pd.concat([_p, _b], axis=1, join="inner").dropna()
+    except ValueError:
+        return None
     if len(merged) < 10: return None
     merged.columns = ["p", "b"]
     var_b = merged["b"].var()
@@ -1506,8 +1531,12 @@ def _sg(iid, *dfs_yrs):
             if 'item_id' in df.columns and yr is not None:
                 row = df[df['item_id'] == alias]
                 if not row.empty:
-                    v = pd.to_numeric(row[yr].values[0], errors='coerce')
-                    if pd.notna(v): return float(v)
+                    cell = row[yr]
+                    # Cột năm có thể bị TRÙNG TÊN → row[yr] trả DataFrame, không phải Series.
+                    # Khi đó .values[0] là mảng → pd.notna() ném ValueError. Lấy cột đầu tiên.
+                    if isinstance(cell, pd.DataFrame): cell = cell.iloc[:, 0]
+                    vals = pd.to_numeric(cell, errors='coerce').dropna()
+                    if len(vals): return float(vals.iloc[0])
             # Format WIDE (VCI): alias là tên cột, lấy giá trị năm mới nhất
             elif alias in df.columns:
                 s = pd.to_numeric(df[alias], errors='coerce').dropna()
@@ -1799,8 +1828,26 @@ with st.spinner(f"⏳ Đang tải {symbol} từ KBS..."):
     except Exception as e:
         st.error(f"❌ Không lấy được dữ liệu giá: {e}\n\nKiểm tra: mã CK có đúng không? Kết nối internet ổn không?")
         st.stop()
-    rat_df, ratio_src = fetch_ratio(symbol)
-    inc_df = fetch_income(symbol)
+    # Dữ liệu tài chính KHÔNG được phép làm sập app — thiếu nó vẫn phân tích kỹ thuật được
+    _fin_err=None
+    try:
+        rat_df, ratio_src = fetch_ratio(symbol)
+    except Exception as _e:
+        rat_df, ratio_src = pd.DataFrame(), "Lỗi tải chỉ số"; _fin_err=f"{type(_e).__name__}: {_e}"
+    try:
+        inc_df = fetch_income(symbol)
+    except Exception:
+        inc_df = pd.DataFrame()
+    # Khử cột trùng tên ngay tại nguồn — nguyên nhân gây ValueError khi chấm điểm cơ bản
+    def _dedup_cols(_d):
+        if _d is None or _d.empty: return _d
+        seen={}; cols=[]
+        for c in _d.columns:
+            c=str(c)
+            if c in seen: seen[c]+=1; cols.append(f"{c}__{seen[c]}")
+            else: seen[c]=0; cols.append(c)
+        _d=_d.copy(); _d.columns=cols; return _d
+    rat_df=_dedup_cols(rat_df); inc_df=_dedup_cols(inc_df)
     bal_df = fetch_balance(symbol)
     cf_df  = fetch_cashflow_stmt(symbol)
     tcbs_extras = fetch_tcbs_extras(symbol)
@@ -1812,18 +1859,50 @@ sig,reasons,score=calc_signal(df); trade=calc_trade(df,score)
 lat=df.iloc[-1]; prev=df.iloc[-2] if len(df)>1 else lat
 qtrend=calc_quant_trend(df)  # QUANT: bộ chỉ báo trend-following bổ sung, không đổi sig/score gốc
 
+# ── Cảnh báo dữ liệu bất thường (ngày GDKHQ chia cổ tức/cổ phiếu thưởng) ──
+# Streamlit Cloud che chi tiết lỗi, nên app tự phát hiện và báo trước thay vì để crash.
+_data_alerts=[]
+try:
+    _chg=df["Close"].pct_change()
+    _big=_chg[abs(_chg)>0.20]
+    if len(_big)>0:
+        _last_big=df.loc[_big.index[-1],"Date"]
+        _gap_move=_big.iloc[-1]*100   # KHÔNG đặt tên _pct: trùng với hàm _pct() dùng ở tab Cơ bản
+        _data_alerts.append(
+            f"Phát hiện biến động **{_gap_move:+.0f}%** trong một phiên ngày "
+            f"{pd.to_datetime(_last_big).strftime('%d/%m/%Y')}. Biên độ HOSE chỉ ±7%, "
+            "nên đây gần như chắc chắn là **ngày giao dịch không hưởng quyền** "
+            "(chia cổ tức bằng cổ phiếu, cổ phiếu thưởng, hoặc chia tách) mà nguồn dữ liệu "
+            "CHƯA điều chỉnh hồi tố. Mọi chỉ báo kỹ thuật và điểm quant của mã này "
+            "**không đáng tin** cho tới khi dữ liệu được điều chỉnh.")
+except Exception:
+    pass
+
 # ── QUANT: RS vs VN-Index + Đề xuất giao dịch định lượng (tính 1 lần, dùng ở nhiều tab) ──
 try:
     vni_df, vni_src = fetch_vnindex(days)
-except Exception:
-    vni_df, vni_src = pd.DataFrame(), "Lỗi khi lấy VN-Index"
+except Exception as _e:
+    vni_df, vni_src = pd.DataFrame(), f"Lỗi khi lấy VN-Index: {type(_e).__name__}"
 rs_series, rs_label = (None, "Không có dữ liệu VN-Index để so sánh")
 rs_slope = None
-if not vni_df.empty:
-    rs_series, rs_label = calc_relative_strength(df, vni_df)
-    if rs_series is not None and len(rs_series) >= 6:
-        rs_slope = float(rs_series.iloc[-1] - rs_series.iloc[-6])
-qdec = calc_quant_decision(df, rs_slope)
+try:
+    if not vni_df.empty:
+        rs_series, rs_label = calc_relative_strength(df, vni_df)
+        if rs_series is not None and len(rs_series) >= 6:
+            rs_slope = float(rs_series.iloc[-1] - rs_series.iloc[-6])
+except Exception as _e:
+    rs_series, rs_label = None, f"Không tính được RS ({type(_e).__name__}: {_e})"
+    rs_slope = None
+try:
+    qdec = calc_quant_decision(df, rs_slope)
+except Exception as _e:
+    st.error(f"❌ Không tính được đề xuất quant cho {symbol}.\n\n"
+             f"**Chi tiết lỗi:** `{type(_e).__name__}: {_e}`\n\n"
+             "Hãy gửi dòng chi tiết lỗi này để được xử lý.")
+    st.stop()
+
+for _a in _data_alerts:
+    st.warning(f"⚠️ **DỮ LIỆU BẤT THƯỜNG** — {_a}")
 
 chg=float(lat.Close)-float(prev.Close); pct_chg=chg/float(prev.Close)*100 if float(prev.Close) else 0
 chg_str=f"{'▲' if chg>=0 else '▼'} {abs(chg):,.0f} đ ({abs(pct_chg):.2f}%)"
