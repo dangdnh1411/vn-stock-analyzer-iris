@@ -567,6 +567,31 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # EMA200 tính bằng ewm không trả NaN, nhưng với <180 phiên nó vẫn chịu ảnh hưởng nặng
     # từ giá trị khởi tạo → không đáng tin làm bộ lọc xu hướng dài hạn.
     df["_bar_idx"]=np.arange(len(df))
+    # ══ CHỈ BÁO CHO MODULE BẮT ĐÁY HOẢNG LOẠN (Capitulation) ══
+    _h=df["High"].astype(float); _l=df["Low"].astype(float)
+    _c=df["Close"].astype(float); _o=df["Open"].astype(float)
+    _rng=(_h-_l).replace(0,np.nan)
+    # CLV: vị trí đóng cửa trong biên độ ngày. +1 = đóng ở đỉnh, -1 = đóng ở đáy.
+    # Khối lượng lớn mà CLV cao = lực bán bị hấp thụ hết.
+    df["CLV"]=((_c-_l)-(_h-_c))/_rng
+    # Tỷ lệ bóng nến dưới so với biên độ — dấu hiệu bị "đỡ" trong phiên
+    df["LowerWick"]=(np.minimum(_o,_c)-_l)/_rng
+    df["UpperWick"]=(_h-np.maximum(_o,_c))/_rng
+    # Chuỗi phiên giảm liên tiếp
+    _down=(_c<_c.shift(1)).astype(int)
+    _streak=[];_cur=0
+    for v in _down:
+        _cur=_cur+1 if v==1 else 0
+        _streak.append(_cur)
+    df["DownStreak"]=_streak
+    # Mức sụt giá so với đỉnh gần nhất (đo độ "quá bán" thực tế, không phải chỉ báo)
+    df["DD_from_High20"]=(_c/_h.rolling(20).max()-1)*100
+    df["DD_from_High60"]=(_c/_h.rolling(60).max()-1)*100
+    # Dòng tiền quay đầu: CMF cải thiện so với 5 phiên trước dù giá vẫn thấp
+    df["CMF_Delta5"]=df["CMF"]-df["CMF"].shift(5)
+    # Khoảng cách tới SMA20/SMA50 — dùng làm mục tiêu chốt lời cho lệnh hồi kỹ thuật
+    df["Dist_SMA20"]=(_c/df["SMA20"]-1)*100
+    df["SMA50"]=_c.rolling(50).mean()
     return df
 
 def detect_patterns(df: pd.DataFrame) -> pd.DataFrame:
@@ -871,6 +896,31 @@ def calc_quant_decision(df, rs_slope=None):
     action, color, note = quant_action(score)
     c = float(lat.Close)
     atr = float(lat.ATR) if pd.notna(lat.get("ATR")) else c*0.02
+
+    # ══ CHỐT CHẶN AN TOÀN ══
+    # (1) ATR = 0 → mã không dao động (bị đình chỉ, ngừng giao dịch, hoặc dữ liệu lỗi).
+    #     Không thể đặt stop hợp lệ → ép biên độ tối thiểu 3% và đánh dấu không giao dịch được.
+    # (2) Không có thanh khoản → mọi tín hiệu kỹ thuật đều vô nghĩa vì không khớp lệnh được.
+    warnings_ = []
+    tradeable = True
+    if atr <= 0 or not np.isfinite(atr):
+        atr = c*0.03
+        tradeable = False
+        warnings_.append("Biên độ dao động bằng 0 — mã có thể đang bị đình chỉ giao dịch "
+                         "hoặc dữ liệu lỗi. KHÔNG giao dịch theo tín hiệu này.")
+    try:
+        _vol20 = float(df["Volume"].tail(20).median())
+        _val20 = float((df["Close"].tail(20)*df["Volume"].tail(20)).mean())
+    except Exception:
+        _vol20, _val20 = 0.0, 0.0
+    if _vol20 <= 0:
+        tradeable = False
+        warnings_.append("Khối lượng giao dịch bằng 0 trong 20 phiên gần nhất — "
+                         "không có thanh khoản để vào/ra lệnh. Điểm quant không có ý nghĩa.")
+    elif _val20 < 1e9:
+        warnings_.append(f"Thanh khoản rất thấp (~{_val20/1e9:.2f} tỷ đ/phiên) — "
+                         "khó khớp lệnh và dễ bị trượt giá mạnh. Cân nhắc bỏ qua mã này.")
+
     chand = float(lat.Chandelier_Long) if pd.notna(lat.get("Chandelier_Long")) else None
     dh20 = float(lat.Donchian_High20) if pd.notna(lat.get("Donchian_High20")) else None
 
@@ -885,13 +935,21 @@ def calc_quant_decision(df, rs_slope=None):
     stop_candidates = [x for x in [chand, entry - 2.5*atr] if x is not None and x < entry]
     stop = max(stop_candidates) if stop_candidates else entry - 2*atr
     stop = min(stop, entry - 1.0*atr)
+    # Sàn an toàn: stop không bao giờ được bằng hoặc trên giá vào
+    if stop >= entry or not np.isfinite(stop):
+        stop = entry*0.97
     risk_per_share = entry - stop
     tp1 = entry + risk_per_share*1.5
     tp2 = entry + risk_per_share*2.5
     tp3 = entry + risk_per_share*4.0
     rr = (tp2-entry)/risk_per_share if risk_per_share > 0 else 0
 
+    # Mã không giao dịch được thì mọi hành động MUA đều vô nghĩa
+    if not tradeable:
+        action, color = "KHÔNG GIAO DỊCH ĐƯỢC", "#cc1133"
+        note = "Mã thiếu thanh khoản hoặc không dao động — bỏ qua bất kể điểm số"
     return dict(score=score, detail=detail, action=action, color=color, note=note,
+                tradeable=tradeable, warnings=warnings_, liquidity_bn=_val20/1e9,
                 entry=entry, entry_note=entry_note, stop=stop, atr=atr,
                 risk_per_share=risk_per_share,
                 risk_pct=(risk_per_share/entry*100) if entry > 0 else 0,
@@ -915,13 +973,34 @@ def quant_position_size(capital, risk_pct_per_trade, entry, stop, max_weight_pct
                 weight_pct=(lots*entry/capital*100) if capital > 0 else 0,
                 capped=capped, risk_per_share=risk_per_share)
 
+# ── Ma sát thị trường Việt Nam (mặc định thận trọng, sát thực tế môi giới online) ──
+VN_COST = dict(
+    fee_buy=0.0015,     # phí mua ~0.15%
+    fee_sell=0.0015,    # phí bán ~0.15%
+    tax_sell=0.0010,    # thuế TNCN chuyển nhượng 0.1% trên giá trị bán
+    slippage=0.0010,    # trượt giá mỗi chiều ~0.1% (mã thanh khoản tốt)
+)
+VN_LIMIT = {"HOSE": 0.07, "HNX": 0.10, "UPCOM": 0.15}
+VN_T_PLUS = 2           # T+2: mua phiên T, sớm nhất bán được phiên T+2
+
 def backtest_quant_signal(df, entry_score=2.5, exit_score=-1.0, rs_slope_series=None,
-                          use_chandelier_stop=True, warmup=60):
-    """Kiểm định hệ thống quant trên chính lịch sử của mã.
-    Quy tắc CHỐNG NHÌN TRƯỚC: tín hiệu tính tại phiên t → khớp lệnh tại giá MỞ CỬA phiên t+1.
-    Thoát khi: điểm quant <= exit_score, HOẶC giá đóng cửa thủng Chandelier Exit."""
+                          use_chandelier_stop=True, warmup=60,
+                          cost=None, price_limit=0.07, t_plus=VN_T_PLUS,
+                          apply_costs=True):
+    """Kiểm định hệ thống quant CÓ MÔ PHỎNG MA SÁT THỊ TRƯỜNG VIỆT NAM.
+
+    Các ràng buộc thực tế được mô phỏng:
+      • Chống nhìn trước: tín hiệu phiên T → khớp tại giá MỞ CỬA phiên T+1
+      • T+2: mua phiên T thì sớm nhất phiên T+2 mới bán được (quy định TTCK VN)
+      • Biên độ giá: không mua được khi mã trần, không bán được khi mã sàn
+      • Chi phí: phí mua + phí bán + thuế bán 0.1% + trượt giá 2 chiều
+    """
     if df is None or len(df) < warmup + 20:
         return None, "Không đủ dữ liệu lịch sử để kiểm định (cần tối thiểu ~80 phiên)"
+    cost = cost or VN_COST
+    fb, fs, tx, sl = (cost["fee_buy"], cost["fee_sell"], cost["tax_sell"], cost["slippage"]) \
+                     if apply_costs else (0.0, 0.0, 0.0, 0.0)
+
     scores = []
     for i in range(len(df)):
         if i < warmup:
@@ -932,44 +1011,73 @@ def backtest_quant_signal(df, entry_score=2.5, exit_score=-1.0, rs_slope_series=
         scores.append(s)
     df = df.copy(); df["QuantScore"] = scores
 
-    trades = []; in_pos = False; entry_px = entry_date = None; entry_stop = None; init_risk = None
+    trades = []; in_pos = False
+    entry_px = entry_date = entry_stop = init_risk = entry_bar = None
+    skipped_ceiling = 0; blocked_floor = 0; blocked_tplus = 0
+
     for i in range(warmup, len(df)-1):
         row = df.iloc[i]; nxt = df.iloc[i+1]
         sc = row["QuantScore"]
         if pd.isna(sc): continue
-        nxt_open = float(nxt.Open)
+        prev_close = float(row.Close); nxt_open = float(nxt.Open)
+        # Trạng thái trần/sàn tại phiên khớp lệnh
+        at_ceiling = nxt_open >= prev_close*(1+price_limit) - 1e-9
+        at_floor   = nxt_open <= prev_close*(1-price_limit) + 1e-9
+
         if not in_pos:
             if sc >= entry_score:
-                in_pos = True; entry_px = nxt_open; entry_date = nxt.Date
+                if at_ceiling:
+                    skipped_ceiling += 1   # mã trần → không có người bán, coi như không khớp được
+                    continue
+                entry_px = nxt_open*(1+sl)          # trượt giá khi mua
+                entry_date = nxt.Date; entry_bar = i+1
+                in_pos = True
                 ch = float(row.Chandelier_Long) if pd.notna(row.get("Chandelier_Long")) else None
                 atr_v = float(row.ATR) if pd.notna(row.get("ATR")) else entry_px*0.02
                 entry_stop = max([x for x in [ch, entry_px-2.5*atr_v] if x is not None and x < entry_px],
                                  default=entry_px-2*atr_v)
-                entry_stop = min(entry_stop, entry_px-1.0*atr_v)  # giữ khoảng cách tối thiểu 1 ATR
+                entry_stop = min(entry_stop, entry_px-1.0*atr_v)
                 init_risk = entry_px - entry_stop
         else:
             hit_stop = use_chandelier_stop and float(row.Close) < entry_stop
             weak = sc <= exit_score
             if hit_stop or weak:
-                exit_px = nxt_open
-                trades.append(dict(entry_date=entry_date, exit_date=nxt.Date,
-                                   entry=entry_px, exit=exit_px,
-                                   pnl_pct=(exit_px-entry_px)/entry_px,
-                                   r_multiple=((exit_px-entry_px)/init_risk) if init_risk > 0 else np.nan,
-                                   reason="Chạm stop ATR" if hit_stop else "Điểm quant suy yếu"))
-                in_pos = False
+                # Ràng buộc T+2: chưa đủ ngày về thì chưa bán được
+                if (i+1) - entry_bar < t_plus:
+                    blocked_tplus += 1
+                elif at_floor:
+                    blocked_floor += 1     # mã sàn → không bán được, phải chờ phiên sau
+                else:
+                    exit_px = nxt_open*(1-sl)       # trượt giá khi bán
+                    gross = (exit_px-entry_px)/entry_px
+                    # Chi phí trọn vòng tính trên giá trị thực tế
+                    cost_pct = fb + (exit_px/entry_px)*(fs+tx)
+                    net = gross - cost_pct
+                    trades.append(dict(entry_date=entry_date, exit_date=nxt.Date,
+                                       entry=entry_px, exit=exit_px,
+                                       pnl_gross=gross, pnl_pct=net, cost_pct=cost_pct,
+                                       bars_held=(i+1)-entry_bar,
+                                       r_multiple=((exit_px-entry_px-entry_px*cost_pct)/init_risk)
+                                                  if init_risk > 0 else np.nan,
+                                       reason="Chạm stop ATR" if hit_stop else "Điểm quant suy yếu"))
+                    in_pos = False
             else:
-                # Trailing stop: nâng dần theo Chandelier, không bao giờ hạ xuống
                 ch = float(row.Chandelier_Long) if pd.notna(row.get("Chandelier_Long")) else None
                 if ch is not None and ch > entry_stop: entry_stop = ch
-    if in_pos:  # còn lệnh mở tại cuối kỳ → chốt theo giá đóng cửa cuối
-        last = df.iloc[-1]
-        trades.append(dict(entry_date=entry_date, exit_date=last.Date, entry=entry_px,
-                           exit=float(last.Close), pnl_pct=(float(last.Close)-entry_px)/entry_px,
-                           r_multiple=((float(last.Close)-entry_px)/init_risk) if init_risk > 0 else np.nan,
+
+    if in_pos:
+        last = df.iloc[-1]; exit_px = float(last.Close)*(1-sl)
+        gross = (exit_px-entry_px)/entry_px
+        cost_pct = fb + (exit_px/entry_px)*(fs+tx)
+        trades.append(dict(entry_date=entry_date, exit_date=last.Date, entry=entry_px, exit=exit_px,
+                           pnl_gross=gross, pnl_pct=gross-cost_pct, cost_pct=cost_pct,
+                           bars_held=len(df)-1-entry_bar,
+                           r_multiple=((exit_px-entry_px-entry_px*cost_pct)/init_risk)
+                                      if init_risk > 0 else np.nan,
                            reason="Còn mở tại cuối kỳ"))
     if not trades:
-        return None, f"Hệ thống không phát sinh lệnh nào trong giai đoạn này (ngưỡng vào {entry_score:+.1f})"
+        return None, (f"Hệ thống không phát sinh lệnh nào (ngưỡng vào {entry_score:+.1f})"
+                      + (f" · {skipped_ceiling} lần bỏ lỡ vì mã trần" if skipped_ceiling else ""))
 
     tdf = pd.DataFrame(trades)
     wins = tdf[tdf["pnl_pct"] > 0]; losses = tdf[tdf["pnl_pct"] <= 0]
@@ -981,16 +1089,338 @@ def backtest_quant_signal(df, entry_score=2.5, exit_score=-1.0, rs_slope_series=
     exp_r = float(tdf["r_multiple"].mean()) if tdf["r_multiple"].notna().any() else None
     equity = (1+tdf["pnl_pct"]).cumprod()
     strat_ret = float(equity.iloc[-1]-1)
+    gross_ret = float((1+tdf["pnl_gross"]).cumprod().iloc[-1]-1)
     peak = equity.cummax(); dd = float(((equity-peak)/peak).min())
     bh_ret = float(df["Close"].iloc[-1]/df["Close"].iloc[warmup]-1)
-    time_in_market = float(sum((t["exit_date"]-t["entry_date"]).days for t in trades)/
-                           max((df["Date"].iloc[-1]-df["Date"].iloc[warmup]).days, 1))
+    time_in_market = float(tdf["bars_held"].sum()/max(len(df)-warmup, 1))
     stats = dict(n_trades=len(tdf), win_rate=win_rate, avg_win=avg_win, avg_loss=avg_loss,
                  profit_factor=pf, expectancy=expectancy, expectancy_r=exp_r,
-                 strat_return=strat_ret, buyhold_return=bh_ret, max_dd=dd,
-                 equity=equity, trades=tdf, time_in_market=time_in_market,
-                 scores=df[["Date","QuantScore"]])
+                 strat_return=strat_ret, gross_return=gross_ret, buyhold_return=bh_ret,
+                 max_dd=dd, equity=equity, trades=tdf, time_in_market=time_in_market,
+                 avg_bars_held=float(tdf["bars_held"].mean()),
+                 total_cost_pct=float(tdf["cost_pct"].sum()),
+                 skipped_ceiling=skipped_ceiling, blocked_floor=blocked_floor,
+                 blocked_tplus=blocked_tplus, scores=df[["Date","QuantScore"]])
     return stats, None
+
+def backtest_multi_symbol(symbols, days=500, entry_score=2.5, exit_score=-1.0,
+                          apply_costs=True, progress_cb=None):
+    """Kiểm định hệ thống trên NHIỀU MÃ để phát hiện overfitting.
+    Một hệ thống chỉ lãi ở 1-2 mã là may mắn; lãi ổn định trên đa số mã mới là lợi thế thật."""
+    rows = []; equities = {}
+    for k, sym in enumerate(symbols):
+        if progress_cb: progress_cb((k+1)/len(symbols), sym)
+        try:
+            pdf, _ = fetch_price(sym, days, "1D")
+            if pdf is None or len(pdf) < 150: continue
+            d = add_indicators(pdf.copy())
+            st_, err = backtest_quant_signal(d, entry_score, exit_score, apply_costs=apply_costs)
+            if st_ is None: continue
+            rows.append(dict(sym=sym, n_trades=st_["n_trades"], win_rate=st_["win_rate"],
+                             expectancy_r=st_["expectancy_r"], profit_factor=st_["profit_factor"],
+                             strat_return=st_["strat_return"], buyhold_return=st_["buyhold_return"],
+                             max_dd=st_["max_dd"], avg_bars=st_["avg_bars_held"]))
+            equities[sym] = st_["equity"]
+        except Exception:
+            continue
+    if not rows:
+        return None, "Không mã nào tạo đủ lệnh để kiểm định"
+    rdf = pd.DataFrame(rows)
+    valid_r = rdf["expectancy_r"].dropna()
+    agg = dict(
+        n_symbols=len(rdf), total_trades=int(rdf["n_trades"].sum()),
+        pct_profitable=float((rdf["strat_return"] > 0).mean()),
+        pct_positive_r=float((valid_r > 0).mean()) if len(valid_r) else None,
+        median_expectancy_r=float(valid_r.median()) if len(valid_r) else None,
+        mean_win_rate=float(rdf["win_rate"].mean()),
+        median_return=float(rdf["strat_return"].median()),
+        median_bh=float(rdf["buyhold_return"].median()),
+        worst_dd=float(rdf["max_dd"].min()),
+        pct_beat_bh=float((rdf["strat_return"] > rdf["buyhold_return"]).mean()),
+        detail=rdf.sort_values("expectancy_r", ascending=False),
+    )
+    return agg, None
+
+
+# ══════════════════ MODULE 2: BẮT ĐÁY HOẢNG LOẠN (CAPITULATION REVERSAL) ══════════════════
+# TRIẾT LÝ NGƯỢC với module trend-following ở trên:
+#   • Trend-following: mua khi giá phá đỉnh, phạt khi giá lệch xa trung bình
+#   • Capitulation:    mua khi giá sụp sâu, THƯỞNG khi giá lệch xa phía dưới
+# Vì vậy hai module dùng THANG ĐIỂM RIÊNG, không trộn — trộn vào nhau sẽ triệt tiêu lẫn nhau.
+# Đây là chiến lược MEAN-REVERSION ngắn hạn: mục tiêu là nhịp hồi kỹ thuật về SMA20/SMA50,
+# KHÔNG phải nắm giữ chờ thành uptrend.
+
+CAP_WEIGHTS = {
+    "vol_climax":   2.5,   # Khối lượng bán tháo cực đại — điều kiện cần
+    "absorption":   2.5,   # Đóng cửa cao trong biên + bóng dưới dài = cầu hấp thụ được cung
+    "depth":        1.5,   # Đã sụt đủ sâu từ đỉnh
+    "extreme":      1.5,   # RSI/Z-score ở vùng cực đoan
+    "exhaustion":   1.0,   # Chuỗi phiên giảm đủ dài (bên bán mệt)
+    "flow_turn":    1.0,   # Dòng tiền bắt đầu quay đầu dù giá còn thấp
+}
+
+def capitulation_row_score(row):
+    """Chấm điểm cường độ hoảng loạn/hấp thụ cho 1 phiên. Thang 0..10 (không có điểm âm —
+    đây là thang đo 'mức độ giống climax', không phải thang mua/bán)."""
+    d={}; raw=0.0; max_used=0.0
+    def _g(k):
+        v=row.get(k) if hasattr(row,"get") else None
+        try:
+            v=float(v); return v if pd.notna(v) else None
+        except (TypeError,ValueError): return None
+
+    # 1. Khối lượng bán tháo cực đại
+    w=CAP_WEIGHTS["vol_climax"]; vr=_g("Vol_Ratio")
+    if vr is not None:
+        max_used+=w
+        if vr>=3.0:   raw+=w;      d["vol_climax"]=(f"🔥 Khối lượng ×{vr:.1f} — bán tháo cực đại",w)
+        elif vr>=2.5: raw+=w*0.75; d["vol_climax"]=(f"Khối lượng ×{vr:.1f} — rất cao",w*0.75)
+        elif vr>=2.0: raw+=w*0.45; d["vol_climax"]=(f"Khối lượng ×{vr:.1f} — cao",w*0.45)
+        else:         d["vol_climax"]=(f"Khối lượng ×{vr:.1f} — chưa đủ cực đoan để gọi là climax",0.0)
+
+    # 2. Hấp thụ: đóng cửa cao trong biên độ + bóng nến dưới dài
+    w=CAP_WEIGHTS["absorption"]; clv=_g("CLV"); lw=_g("LowerWick")
+    if clv is not None:
+        max_used+=w; val=0.0; notes=[]
+        if clv>=0.3:    val+=w*0.6; notes.append(f"đóng cửa nửa trên biên (CLV {clv:+.2f})")
+        elif clv>=-0.1: val+=w*0.3; notes.append(f"đóng cửa giữa biên (CLV {clv:+.2f})")
+        else:           notes.append(f"đóng cửa sát đáy biên (CLV {clv:+.2f}) — bên bán còn thắng")
+        if lw is not None:
+            if lw>=0.4:   val+=w*0.4; notes.append(f"bóng dưới dài {lw*100:.0f}% biên — bị đỡ mạnh")
+            elif lw>=0.25: val+=w*0.2; notes.append(f"bóng dưới {lw*100:.0f}% biên")
+        raw+=val; d["absorption"]=(" · ".join(notes),round(val,2))
+
+    # 3. Độ sâu sụt giảm
+    w=CAP_WEIGHTS["depth"]; dd20=_g("DD_from_High20")
+    if dd20 is not None:
+        max_used+=w
+        if dd20<=-18:   raw+=w;      d["depth"]=(f"Đã sụt {dd20:.0f}% từ đỉnh 20 phiên — rất sâu",w)
+        elif dd20<=-12: raw+=w*0.7;  d["depth"]=(f"Đã sụt {dd20:.0f}% từ đỉnh 20 phiên",w*0.7)
+        elif dd20<=-7:  raw+=w*0.35; d["depth"]=(f"Sụt {dd20:.0f}% từ đỉnh — mức điều chỉnh thường",w*0.35)
+        else:           d["depth"]=(f"Mới sụt {dd20:.0f}% — chưa đủ sâu để có nhịp hồi đáng kể",0.0)
+
+    # 4. Cực đoan thống kê
+    w=CAP_WEIGHTS["extreme"]; rsi=_g("RSI"); z=_g("Zscore20")
+    if rsi is not None or z is not None:
+        max_used+=w; val=0.0; notes=[]
+        if rsi is not None:
+            if rsi<25:   val+=w*0.5; notes.append(f"RSI {rsi:.0f} cực thấp")
+            elif rsi<32: val+=w*0.3; notes.append(f"RSI {rsi:.0f} quá bán")
+            else:        notes.append(f"RSI {rsi:.0f}")
+        if z is not None:
+            if z<=-2.5:  val+=w*0.5; notes.append(f"Z-score {z:.1f} lệch cực xa phía dưới")
+            elif z<=-1.8: val+=w*0.3; notes.append(f"Z-score {z:.1f} lệch xa")
+            else:         notes.append(f"Z-score {z:.1f}")
+        raw+=val; d["extreme"]=(" · ".join(notes),round(val,2))
+
+    # 5. Bên bán kiệt sức
+    w=CAP_WEIGHTS["exhaustion"]; ds=_g("DownStreak")
+    if ds is not None:
+        max_used+=w
+        if 4<=ds<=8:  raw+=w;      d["exhaustion"]=(f"{int(ds)} phiên giảm liên tiếp — bên bán có dấu hiệu kiệt",w)
+        elif ds>8:    raw+=w*0.5;  d["exhaustion"]=(f"{int(ds)} phiên giảm liên tiếp — xu hướng giảm quá dai, cẩn trọng",w*0.5)
+        elif ds>=2:   raw+=w*0.4;  d["exhaustion"]=(f"{int(ds)} phiên giảm liên tiếp",w*0.4)
+        else:         d["exhaustion"]=("Chưa có chuỗi giảm — có thể mới bắt đầu xả",0.0)
+
+    # 6. Dòng tiền quay đầu
+    w=CAP_WEIGHTS["flow_turn"]; cd=_g("CMF_Delta5"); cmf=_g("CMF")
+    if cd is not None:
+        max_used+=w
+        if cd>0.05:   raw+=w;      d["flow_turn"]=(f"CMF cải thiện {cd:+.2f} trong 5 phiên — tiền bắt đầu vào",w)
+        elif cd>0:    raw+=w*0.5;  d["flow_turn"]=(f"CMF nhích lên {cd:+.2f}",w*0.5)
+        else:         d["flow_turn"]=(f"CMF vẫn xấu đi ({cd:+.2f}) — tiền còn đang rút ra",0.0)
+
+    score=(raw/max_used*10) if max_used>0 else 0.0
+    return round(score,2), d
+
+def calc_capitulation_signal(df, min_score=6.0, confirm_window=3, min_liquidity_bn=None):
+    """Tìm tín hiệu bắt đáy CÓ XÁC NHẬN.
+    Quy tắc: KHÔNG mua ngay phiên climax (dễ là dao rơi). Phải có phiên xác nhận sau đó
+    giữ được trên đáy phiên climax VÀ đóng cửa xanh."""
+    if df is None or len(df)<60:
+        return dict(state="no_data", msg="Không đủ dữ liệu (cần ≥60 phiên)")
+    lat=df.iloc[-1]; c=float(lat.Close)
+
+    # Tìm phiên climax gần nhất trong cửa sổ xác nhận
+    climax_idx=None; climax_score=0.0; climax_detail={}
+    for k in range(1, min(confirm_window,len(df)-1)+1):
+        row=df.iloc[-1-k]
+        s,det=capitulation_row_score(row)
+        if s>=min_score:
+            climax_idx=len(df)-1-k; climax_score=s; climax_detail=det
+            break
+
+    cur_score,cur_detail=capitulation_row_score(lat)
+
+    # Trường hợp phiên hiện tại CHÍNH LÀ climax → chưa được mua, phải chờ xác nhận
+    if cur_score>=min_score and climax_idx is None:
+        return dict(state="climax_today", score=cur_score, detail=cur_detail,
+            climax_low=float(lat.Low), climax_date=lat.Date,
+            msg="Phiên hôm nay có dấu hiệu bán tháo/hấp thụ — NHƯNG chưa được mua. "
+                "Phải chờ phiên sau giữ được trên đáy hôm nay mới vào lệnh.")
+
+    if climax_idx is None:
+        return dict(state="none", score=cur_score, detail=cur_detail,
+            msg=f"Chưa có phiên bán tháo đủ mạnh trong {confirm_window} phiên gần nhất "
+                f"(điểm cao nhất {cur_score:.1f}/10, cần ≥{min_score:.1f}).")
+
+    climax_row=df.iloc[climax_idx]
+    climax_low=float(climax_row.Low)
+    # Điều kiện xác nhận
+    held=c>climax_low
+    green=c>float(lat.Open)
+    bars_since=len(df)-1-climax_idx
+    if not held:
+        return dict(state="failed", score=climax_score, detail=climax_detail,
+            climax_low=climax_low, climax_date=climax_row.Date,
+            msg=f"Đã có phiên bán tháo ngày {pd.to_datetime(climax_row.Date).strftime('%d/%m')} "
+                f"nhưng giá ĐÃ THỦNG đáy phiên đó ({climax_low:,.0f}) — tín hiệu hỏng, "
+                "đây là dao rơi chứ không phải hấp thụ. Không mua.")
+    if not green:
+        return dict(state="waiting", score=climax_score, detail=climax_detail,
+            climax_low=climax_low, climax_date=climax_row.Date, bars_since=bars_since,
+            msg=f"Có phiên bán tháo ngày {pd.to_datetime(climax_row.Date).strftime('%d/%m')}, "
+                "giá vẫn giữ trên đáy nhưng phiên xác nhận chưa đóng cửa xanh. Tiếp tục theo dõi.")
+
+    # ĐỦ ĐIỀU KIỆN
+    atr=float(lat.ATR) if pd.notna(lat.get("ATR")) else c*0.03
+    stop=climax_low*0.99                     # dưới đáy climax 1%
+    stop=min(stop, c-1.0*atr)                # và cách giá vào tối thiểu 1 ATR
+    sma20=float(lat.SMA20) if pd.notna(lat.get("SMA20")) else c*1.08
+    sma50=float(lat.SMA50) if pd.notna(lat.get("SMA50")) else c*1.15
+    risk=c-stop
+    tp1=max(sma20, c+risk*1.5)
+    tp2=max(sma50, c+risk*2.5)
+    rr=(tp1-c)/risk if risk>0 else 0
+    return dict(state="ready", score=climax_score, detail=climax_detail,
+        climax_low=climax_low, climax_date=climax_row.Date, bars_since=bars_since,
+        entry=c, stop=stop, tp1=tp1, tp2=tp2, rr=rr, risk=risk,
+        risk_pct=risk/c*100 if c>0 else 0, sma20=sma20, sma50=sma50,
+        msg=f"Đủ điều kiện: phiên bán tháo ngày {pd.to_datetime(climax_row.Date).strftime('%d/%m')} "
+            f"(điểm {climax_score:.1f}/10), giá giữ trên đáy {climax_low:,.0f} và đã có phiên xác nhận xanh.")
+
+def backtest_capitulation(df, min_score=6.0, confirm_window=3, max_hold=15,
+                          cost=None, price_limit=0.07, t_plus=VN_T_PLUS, apply_costs=True,
+                          warmup=60):
+    """Kiểm định chiến lược bắt đáy VỚI ma sát thị trường VN.
+    Đặc biệt quan trọng với chiến lược này: đo số lần KẸT SÀN không bán được —
+    đây là rủi ro chí mạng mà backtest thông thường bỏ qua."""
+    if df is None or len(df)<warmup+30:
+        return None,"Không đủ dữ liệu để kiểm định (cần ≥90 phiên)"
+    cost=cost or VN_COST
+    fb,fs,tx,sl=(cost["fee_buy"],cost["fee_sell"],cost["tax_sell"],cost["slippage"]) \
+                if apply_costs else (0.0,0.0,0.0,0.0)
+
+    cap_scores=[np.nan]*len(df)
+    for i in range(warmup,len(df)):
+        s,_=capitulation_row_score(df.iloc[i]); cap_scores[i]=s
+    df=df.copy(); df["CapScore"]=cap_scores
+
+    trades=[]; in_pos=False
+    entry_px=entry_date=entry_bar=stop_px=init_risk=target=None
+    blocked_floor=0; blocked_tplus=0; skipped_ceiling=0; failed_signals=0
+
+    for i in range(warmup+confirm_window, len(df)-1):
+        row=df.iloc[i]; nxt=df.iloc[i+1]
+        prev_close=float(row.Close); nxt_open=float(nxt.Open)
+        at_ceiling=nxt_open>=prev_close*(1+price_limit)-1e-9
+        at_floor=nxt_open<=prev_close*(1-price_limit)+1e-9
+
+        if not in_pos:
+            # tìm climax trong cửa sổ
+            cidx=None
+            for k in range(1,confirm_window+1):
+                if i-k<warmup: break
+                if df["CapScore"].iloc[i-k]>=min_score: cidx=i-k; break
+            if cidx is None: continue
+            climax_low=float(df.iloc[cidx].Low)
+            if float(row.Close)<=climax_low:
+                failed_signals+=1; continue           # thủng đáy climax → dao rơi
+            if float(row.Close)<=float(row.Open): continue   # chưa có nến xác nhận xanh
+            if at_ceiling: skipped_ceiling+=1; continue
+            entry_px=nxt_open*(1+sl); entry_date=nxt.Date; entry_bar=i+1; in_pos=True
+            atr_v=float(row.ATR) if pd.notna(row.get("ATR")) else entry_px*0.03
+            stop_px=min(climax_low*0.99, entry_px-1.0*atr_v)
+            init_risk=entry_px-stop_px
+            target=float(row.SMA20) if pd.notna(row.get("SMA20")) else entry_px*1.08
+        else:
+            cur_close=float(row.Close)
+            hit_stop=cur_close<stop_px
+            hit_target=cur_close>=target
+            timeout=(i+1)-entry_bar>=max_hold
+            if hit_stop or hit_target or timeout:
+                if (i+1)-entry_bar<t_plus:
+                    blocked_tplus+=1
+                elif at_floor:
+                    blocked_floor+=1              # mã sàn → KHÔNG bán được, chịu tiếp
+                else:
+                    exit_px=nxt_open*(1-sl)
+                    gross=(exit_px-entry_px)/entry_px
+                    cost_pct=fb+(exit_px/entry_px)*(fs+tx)
+                    trades.append(dict(entry_date=entry_date,exit_date=nxt.Date,
+                        entry=entry_px,exit=exit_px,pnl_gross=gross,pnl_pct=gross-cost_pct,
+                        cost_pct=cost_pct,bars_held=(i+1)-entry_bar,
+                        r_multiple=((exit_px-entry_px-entry_px*cost_pct)/init_risk) if init_risk>0 else np.nan,
+                        reason="Chạm mục tiêu SMA20" if hit_target else
+                               "Cắt lỗ thủng đáy climax" if hit_stop else "Hết thời gian giữ"))
+                    in_pos=False
+            else:
+                t2=float(row.SMA20) if pd.notna(row.get("SMA20")) else target
+                target=t2
+
+    if in_pos:
+        last=df.iloc[-1]; exit_px=float(last.Close)*(1-sl)
+        gross=(exit_px-entry_px)/entry_px; cost_pct=fb+(exit_px/entry_px)*(fs+tx)
+        trades.append(dict(entry_date=entry_date,exit_date=last.Date,entry=entry_px,exit=exit_px,
+            pnl_gross=gross,pnl_pct=gross-cost_pct,cost_pct=cost_pct,
+            bars_held=len(df)-1-entry_bar,
+            r_multiple=((exit_px-entry_px-entry_px*cost_pct)/init_risk) if init_risk>0 else np.nan,
+            reason="Còn mở tại cuối kỳ"))
+    if not trades:
+        return None,(f"Không phát sinh lệnh nào (ngưỡng climax {min_score:.1f}/10)"
+                     +(f" · {failed_signals} tín hiệu hỏng do thủng đáy climax" if failed_signals else ""))
+
+    tdf=pd.DataFrame(trades)
+    wins=tdf[tdf["pnl_pct"]>0]; losses=tdf[tdf["pnl_pct"]<=0]
+    wr=len(wins)/len(tdf)
+    aw=float(wins["pnl_pct"].mean()) if len(wins) else 0.0
+    al=float(abs(losses["pnl_pct"].mean())) if len(losses) else 0.0
+    pf=float(wins["pnl_pct"].sum()/abs(losses["pnl_pct"].sum())) if len(losses) and losses["pnl_pct"].sum()!=0 else None
+    er=float(tdf["r_multiple"].mean()) if tdf["r_multiple"].notna().any() else None
+    eq=(1+tdf["pnl_pct"]).cumprod()
+    peak=eq.cummax(); dd=float(((eq-peak)/peak).min())
+    worst=float(tdf["pnl_pct"].min())
+    return dict(n_trades=len(tdf),win_rate=wr,avg_win=aw,avg_loss=al,profit_factor=pf,
+        expectancy=wr*aw-(1-wr)*al,expectancy_r=er,
+        strat_return=float(eq.iloc[-1]-1),gross_return=float((1+tdf["pnl_gross"]).cumprod().iloc[-1]-1),
+        max_dd=dd,worst_trade=worst,equity=eq,trades=tdf,
+        avg_bars_held=float(tdf["bars_held"].mean()),
+        total_cost_pct=float(tdf["cost_pct"].sum()),
+        blocked_floor=blocked_floor,blocked_tplus=blocked_tplus,
+        skipped_ceiling=skipped_ceiling,failed_signals=failed_signals),None
+
+@st.cache_data(ttl=300,show_spinner=False)
+def scan_capitulation(sym, days=365, min_score=6.0, confirm_window=3):
+    """Quét mã có dấu hiệu bán tháo/hấp thụ. Dùng lại fetch_price nên không thêm nguồn lỗi mới."""
+    try:
+        df2,_=fetch_price(sym,days,"1D")
+        if df2 is None or len(df2)<60: return None
+        d=add_indicators(df2.copy())
+        sig=calc_capitulation_signal(d,min_score,confirm_window)
+        lat=d.iloc[-1]
+        liq=float((d["Close"].tail(20)*d["Volume"].tail(20)).mean()/1e9)
+        return dict(sym=sym,close=float(lat.Close),state=sig.get("state"),
+            score=sig.get("score",0),msg=sig.get("msg",""),
+            entry=sig.get("entry"),stop=sig.get("stop"),tp1=sig.get("tp1"),tp2=sig.get("tp2"),
+            rr=sig.get("rr"),risk_pct=sig.get("risk_pct"),climax_low=sig.get("climax_low"),
+            vol_ratio=float(lat.Vol_Ratio) if pd.notna(lat.Vol_Ratio) else 0,
+            rsi=float(lat.RSI) if pd.notna(lat.RSI) else 50,
+            clv=float(lat.CLV) if pd.notna(lat.get("CLV")) else 0,
+            dd20=float(lat.DD_from_High20) if pd.notna(lat.get("DD_from_High20")) else 0,
+            downstreak=int(lat.DownStreak) if pd.notna(lat.get("DownStreak")) else 0,
+            liquidity_bn=liq,detail=sig.get("detail",{}))
+    except Exception:
+        return None
 
 # ══════════════════════════════ QUANT PORTFOLIO METRICS ════════════════════════
 def sharpe_ratio(daily_returns: pd.Series, rf_annual: float = 0.03, periods: int = 252):
@@ -1399,7 +1829,7 @@ chg=float(lat.Close)-float(prev.Close); pct_chg=chg/float(prev.Close)*100 if flo
 chg_str=f"{'▲' if chg>=0 else '▼'} {abs(chg):,.0f} đ ({abs(pct_chg):.2f}%)"
 st.caption(f"📡 Nguồn: {price_src} · {len(df)} phiên · {'🟢' if chg>=0 else '🔴'} {chg_str} · {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
 
-tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8=st.tabs(["📉 Kỹ thuật","📊 Cơ bản","💰 Dòng tiền","🏭 Ngành","🔍 Quét mã","📰 Tin tức","🎯 Tổng hợp","📐 Quant Portfolio"])
+tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9=st.tabs(["📉 Kỹ thuật","📊 Cơ bản","💰 Dòng tiền","🏭 Ngành","🔍 Quét mã","📰 Tin tức","🎯 Tổng hợp","📐 Quant Portfolio","🩸 Bắt đáy hoảng loạn"])
 
 # ── TAB 1: KỸ THUẬT ────────────────────────────────────────────────────────
 with tab1:
@@ -1515,6 +1945,9 @@ with tab1:
           <div style='font-size:12px;color:#cce0ff;margin-top:8px;'>{qdec['note']}</div>
         </div>
       </div></div>""",unsafe_allow_html=True)
+
+    for _w in qdec.get("warnings",[]):
+        st.error(f"🚫 {_w}")
 
     e1,e2,e3,e4=st.columns(4)
     e1.markdown(trade_card_html("📗","GIÁ VÀO",f"{qdec['entry']:,.0f} đ",qdec['entry_note'],"#00d97e"),unsafe_allow_html=True)
@@ -2285,27 +2718,41 @@ with tab8:
     st.markdown("---")
     st.markdown("---")
     st.markdown("#### 5️⃣ Kiểm định hệ thống Quant trên lịch sử (backtest)")
-    st.caption(f"Chạy đúng bộ quy tắc đang dùng để ra đề xuất, trên toàn bộ lịch sử của **{symbol}**. "
-               "Quy tắc chống nhìn trước: tín hiệu tại phiên T → khớp lệnh tại giá MỞ CỬA phiên T+1. "
-               "Thoát lệnh khi điểm quant suy yếu hoặc giá thủng Chandelier Exit (trailing stop theo ATR).")
+    st.caption(f"Chạy đúng bộ quy tắc đang dùng để ra đề xuất, trên lịch sử của **{symbol}**, "
+               "CÓ mô phỏng ma sát thị trường Việt Nam: tín hiệu phiên T khớp giá mở cửa T+1, "
+               "ràng buộc **T+2** (mua hôm nay sớm nhất 2 phiên sau mới bán được), "
+               "**biên độ trần/sàn** (mã trần không mua được, mã sàn không bán được), "
+               "phí mua/bán, thuế bán 0.1% và trượt giá.")
     bt1,bt2,bt3=st.columns(3)
     bt_entry=bt1.number_input("Ngưỡng điểm VÀO lệnh",value=2.5,step=0.5,
         min_value=0.0,max_value=8.0,key="bt_entry")
     bt_exit=bt2.number_input("Ngưỡng điểm THOÁT lệnh",value=-1.0,step=0.5,
         min_value=-8.0,max_value=2.0,key="bt_exit")
     bt_stop=bt3.checkbox("Bật trailing stop ATR",value=True,key="bt_stop")
+    bc1,bc2,bc3,bc4=st.columns(4)
+    bt_costs=bc1.checkbox("Tính phí & thuế",value=True,key="bt_costs",
+        help="Tắt để thấy hệ thống 'đẹp' cỡ nào khi bỏ qua chi phí — chỉ dùng để so sánh, không phải kết quả thật")
+    bt_feeb=bc2.number_input("Phí mua (%)",value=0.15,step=0.05,min_value=0.0,max_value=1.0,key="bt_feeb")/100
+    bt_fees=bc3.number_input("Phí bán (%)",value=0.15,step=0.05,min_value=0.0,max_value=1.0,key="bt_fees")/100
+    bt_slip=bc4.number_input("Trượt giá mỗi chiều (%)",value=0.10,step=0.05,min_value=0.0,max_value=1.0,key="bt_slip")/100
+    bl1,bl2=st.columns(2)
+    bt_limit=bl1.selectbox("Sàn niêm yết (biên độ giá)",["HOSE ±7%","HNX ±10%","UPCOM ±15%"],key="bt_limit")
+    bt_tplus=bl2.selectbox("Chu kỳ thanh toán",["T+2 (thực tế VN)","T+0 (bỏ ràng buộc)"],key="bt_tplus")
+    _limit_map={"HOSE ±7%":0.07,"HNX ±10%":0.10,"UPCOM ±15%":0.15}
 
     if st.button("🔬 Chạy kiểm định lịch sử", key="btn_backtest", use_container_width=True):
         with st.spinner("Đang chạy kiểm định..."):
             rs_slope_series=None
             try:
                 if rs_series is not None and len(rs_series)>10:
-                    rs_map=rs_series.diff(5)          # độ dốc RS 5 phiên, căn theo Date
+                    rs_map=rs_series.diff(5)
                     rs_slope_series=df["Date"].map(rs_map).reset_index(drop=True)
             except Exception:
                 rs_slope_series=None
-            bt_stats, bt_err = backtest_quant_signal(df, bt_entry, bt_exit,
-                                                     rs_slope_series, bt_stop)
+            _cost=dict(fee_buy=bt_feeb,fee_sell=bt_fees,tax_sell=0.001,slippage=bt_slip)
+            bt_stats, bt_err = backtest_quant_signal(df, bt_entry, bt_exit, rs_slope_series, bt_stop,
+                cost=_cost, price_limit=_limit_map[bt_limit],
+                t_plus=(2 if bt_tplus.startswith("T+2") else 0), apply_costs=bt_costs)
             st.session_state.bt_result=(bt_stats, bt_err, symbol)
 
     btr=st.session_state.get("bt_result")
@@ -2316,7 +2763,7 @@ with tab8:
         elif bt_stats:
             m1,m2,m3,m4=st.columns(4)
             m1.markdown(metric_html("Số lệnh",f"{bt_stats['n_trades']}",
-                "#00d97e" if bt_stats['n_trades']>=20 else "#f5a623"),unsafe_allow_html=True)
+                "#00d97e" if bt_stats['n_trades']>=30 else "#f5a623"),unsafe_allow_html=True)
             wr=bt_stats['win_rate']
             m2.markdown(metric_html("Win Rate",f"{wr*100:.0f}%",
                 "#00d97e" if wr>0.45 else "#f5a623"),unsafe_allow_html=True)
@@ -2325,47 +2772,68 @@ with tab8:
                 "#00d97e" if pf and pf>1.5 else "#f5a623" if pf and pf>1 else "#ff3d5a"),unsafe_allow_html=True)
             er=bt_stats['expectancy_r']
             m4.markdown(metric_html("Expectancy (R/lệnh)",f"{er:+.2f}R" if er is not None else "—",
-                "#00d97e" if er and er>0 else "#ff3d5a"),unsafe_allow_html=True)
+                "#00d97e" if er and er>0.2 else "#f5a623" if er and er>0 else "#ff3d5a"),unsafe_allow_html=True)
 
             m5,m6,m7,m8=st.columns(4)
-            sr=bt_stats['strat_return']; bh=bt_stats['buyhold_return']
-            m5.markdown(metric_html("Lợi nhuận hệ thống",f"{sr*100:+.1f}%",
+            sr=bt_stats['strat_return']; gr=bt_stats['gross_return']; bh=bt_stats['buyhold_return']
+            m5.markdown(metric_html("Lãi RÒNG (sau phí)",f"{sr*100:+.1f}%",
                 "#00d97e" if sr>0 else "#ff3d5a"),unsafe_allow_html=True)
-            m6.markdown(metric_html("Mua & nắm giữ",f"{bh*100:+.1f}%",
+            m6.markdown(metric_html("Lãi gộp (trước phí)",f"{gr*100:+.1f}%","#8baed4"),unsafe_allow_html=True)
+            m7.markdown(metric_html("Mua & nắm giữ",f"{bh*100:+.1f}%",
                 "#00d97e" if bh>0 else "#ff3d5a"),unsafe_allow_html=True)
-            m7.markdown(metric_html("Max Drawdown",f"{bt_stats['max_dd']*100:.1f}%","#ff3d5a"),unsafe_allow_html=True)
-            m8.markdown(metric_html("Thời gian nắm giữ",f"{bt_stats['time_in_market']*100:.0f}%",
-                "#8baed4"),unsafe_allow_html=True)
+            m8.markdown(metric_html("Max Drawdown",f"{bt_stats['max_dd']*100:.1f}%","#ff3d5a"),unsafe_allow_html=True)
 
-            # Kết luận thẳng thắn về chất lượng hệ thống
+            m9,m10,m11,m12=st.columns(4)
+            m9.markdown(metric_html("Giữ lệnh TB",f"{bt_stats['avg_bars_held']:.0f} phiên"),unsafe_allow_html=True)
+            m10.markdown(metric_html("Chi phí ăn mất",f"{bt_stats['total_cost_pct']*100:.1f}%","#ff3d5a"),unsafe_allow_html=True)
+            m11.markdown(metric_html("Bỏ lỡ do mã TRẦN",f"{bt_stats['skipped_ceiling']}",
+                "#f5a623" if bt_stats['skipped_ceiling']>0 else "#8baed4"),unsafe_allow_html=True)
+            m12.markdown(metric_html("Kẹt T+2 / mã SÀN",
+                f"{bt_stats['blocked_tplus']} / {bt_stats['blocked_floor']}",
+                "#ff3d5a" if (bt_stats['blocked_tplus']+bt_stats['blocked_floor'])>0 else "#8baed4"),unsafe_allow_html=True)
+
             verdict=[]
-            if bt_stats['n_trades']<20:
-                verdict.append(("#f5a623","⚠️ Mẫu quá nhỏ (<20 lệnh) — các con số trên chưa đủ tin cậy thống kê. "
-                                "Đừng dựa vào kết quả này để tăng tỷ trọng."))
-            if er is not None and er>0 and pf and pf>1.3:
-                verdict.append(("#00d97e","✅ Hệ thống có kỳ vọng dương trên mã này — mỗi lệnh trung bình lãi "
-                                f"{er:+.2f} lần mức rủi ro bỏ ra."))
+            if bt_stats['n_trades']<30:
+                verdict.append(("#f5a623",f"⚠️ Chỉ {bt_stats['n_trades']} lệnh — **chưa đủ mẫu để kết luận**. "
+                    "Thống kê giao dịch cần tối thiểu ~30 lệnh mới bớt nhiễu; dưới mức đó, "
+                    "kết quả tốt hay xấu phần lớn là may rủi. Hãy chạy mục 6 (kiểm định đa mã) trước khi tin."))
+            cost_drag=gr-sr
+            if cost_drag>0.001:
+                pct_eaten=cost_drag/abs(gr)*100 if gr!=0 else 0
+                verdict.append(("#f5a623" if pct_eaten<30 else "#ff3d5a",
+                    f"💸 Chi phí giao dịch nuốt **{cost_drag*100:.1f} điểm %** lợi nhuận "
+                    f"(≈{pct_eaten:.0f}% lợi nhuận gộp). Giữ lệnh trung bình {bt_stats['avg_bars_held']:.0f} phiên — "
+                    + ("giao dịch càng ngắn, phần bị nuốt càng lớn."
+                       if bt_stats['avg_bars_held']<10 else
+                       "chu kỳ này đủ dài để chi phí không phá vỡ lợi thế.")))
+            if er is not None and er>0.2 and pf and pf>1.3:
+                verdict.append(("#00d97e",f"✅ Kỳ vọng dương sau chi phí: mỗi lệnh trung bình lãi {er:+.2f}R."))
             elif er is not None and er<=0:
-                verdict.append(("#ff3d5a","❌ Kỳ vọng ÂM trên mã này — hệ thống trend-following không phù hợp "
-                                "với đặc tính giá của mã. Không nên áp dụng máy móc."))
+                verdict.append(("#ff3d5a","❌ Kỳ vọng ÂM sau chi phí — hệ thống KHÔNG có lợi thế trên mã này. "
+                    "Đừng giao dịch mã này theo hệ thống, dù tín hiệu hiện tại có đẹp đến đâu."))
+            elif er is not None:
+                verdict.append(("#f5a623",f"⚠️ Kỳ vọng dương nhưng mỏng ({er:+.2f}R) — biên an toàn hẹp, "
+                    "chỉ cần phí cao hơn hoặc trượt giá xấu hơn dự kiến là mất lợi thế."))
+            if bt_stats['blocked_tplus']>0:
+                verdict.append(("#f5a623",f"⏳ Có {bt_stats['blocked_tplus']} lần hệ thống muốn thoát nhưng "
+                    "**vướng T+2 chưa bán được** — đây là rủi ro thật của TTCK Việt Nam mà backtest thông thường bỏ qua."))
             if sr<bh:
-                verdict.append(("#f5a623",f"⚠️ Hệ thống ({sr*100:+.1f}%) thua Mua & nắm giữ ({bh*100:+.1f}%) "
-                                "trong giai đoạn này — nhưng cần nhìn thêm Max Drawdown: hệ thống có cắt lỗ nên "
-                                "thường chịu sụt giảm nhẹ hơn khi thị trường xấu."))
+                verdict.append(("#f5a623",f"⚠️ Hệ thống ({sr*100:+.1f}%) thua Mua & nắm giữ ({bh*100:+.1f}%). "
+                    f"Đổi lại drawdown chỉ {bt_stats['max_dd']*100:.1f}% — cân nhắc anh coi trọng lợi nhuận hay giấc ngủ."))
             else:
-                verdict.append(("#00d97e",f"✅ Hệ thống ({sr*100:+.1f}%) vượt Mua & nắm giữ ({bh*100:+.1f}%)."))
+                verdict.append(("#00d97e",f"✅ Hệ thống ({sr*100:+.1f}%) vượt Mua & nắm giữ ({bh*100:+.1f}%) sau chi phí."))
             for clr,txt in verdict:
                 st.markdown(f"<div style='background:#0c1d2e;border-left:4px solid {clr};"
                             f"border-radius:0 8px 8px 0;padding:10px 14px;margin:6px 0;"
-                            f"font-size:13px;color:#cce0ff;'>{txt}</div>",unsafe_allow_html=True)
+                            f"font-size:13px;color:#cce0ff;line-height:1.6;'>{txt}</div>",unsafe_allow_html=True)
 
             eq=bt_stats['equity']
             fig_bt=go.Figure()
             fig_bt.add_trace(go.Scatter(y=eq.values,x=list(range(1,len(eq)+1)),
-                mode="lines+markers",name="Vốn theo lệnh",
+                mode="lines+markers",name="Vốn (ròng)",
                 line=dict(color="#00d97e",width=2),marker=dict(size=5)))
             fig_bt.add_hline(y=1,line=dict(color="rgba(255,255,255,.3)",dash="dot",width=1))
-            fig_bt.update_layout(height=260,title="Đường vốn qua từng lệnh (khởi điểm = 1)",
+            fig_bt.update_layout(height=260,title="Đường vốn qua từng lệnh, sau phí (khởi điểm = 1)",
                 template="plotly_dark",**CHART_STYLE)
             fig_bt.layout.title.font.color="#8baed4"; fig_bt.layout.title.font.size=12
             fig_bt.update_xaxes(title_text="Lệnh thứ")
@@ -2377,18 +2845,196 @@ with tab8:
                 td["Ngày ra"]=pd.to_datetime(td["exit_date"]).dt.strftime("%d/%m/%Y")
                 td["Giá vào"]=td["entry"].apply(lambda v:f"{v:,.0f}")
                 td["Giá ra"]=td["exit"].apply(lambda v:f"{v:,.0f}")
-                td["Lãi/lỗ"]=td["pnl_pct"].apply(lambda v:f"{v*100:+.1f}%")
+                td["Phiên giữ"]=td["bars_held"]
+                td["Lãi gộp"]=td["pnl_gross"].apply(lambda v:f"{v*100:+.1f}%")
+                td["Phí"]=td["cost_pct"].apply(lambda v:f"−{v*100:.2f}%")
+                td["Lãi ròng"]=td["pnl_pct"].apply(lambda v:f"{v*100:+.1f}%")
                 td["R"]=td["r_multiple"].apply(lambda v:f"{v:+.2f}R" if pd.notna(v) else "—")
-                td["Lý do thoát"]=td["reason"]
-                st.dataframe(td[["Ngày vào","Ngày ra","Giá vào","Giá ra","Lãi/lỗ","R","Lý do thoát"]],
+                st.dataframe(td[["Ngày vào","Ngày ra","Phiên giữ","Giá vào","Giá ra",
+                                 "Lãi gộp","Phí","Lãi ròng","R","reason"]].rename(columns={"reason":"Lý do thoát"}),
                              use_container_width=True,hide_index=True)
 
-            st.caption("⚠️ Kiểm định trên MỘT mã và MỘT giai đoạn — kết quả tốt không đảm bảo lặp lại. "
-                       "Chưa tính phí giao dịch, thuế, trượt giá và quy định T+2 của thị trường Việt Nam. "
-                       "Nên chạy trên nhiều mã khác nhau trước khi tin vào hệ thống.")
+            st.caption("⚠️ Vẫn còn giới hạn: kiểm định trên MỘT mã, chưa mô phỏng khối lượng khớp thực tế "
+                       "(lệnh lớn có thể không khớp hết ở giá mở cửa), chưa tính cổ tức/chia tách nếu nguồn dữ liệu "
+                       "không điều chỉnh giá. Hãy dùng mục 6 bên dưới để kiểm tra hệ thống trên nhiều mã.")
+
+    # ══ KIỂM ĐỊNH ĐA MÃ — PHÁT HIỆN OVERFITTING ══
+    st.markdown("---")
+    st.markdown("#### 6️⃣ Kiểm định ĐA MÃ — hệ thống có lợi thế thật hay chỉ may ở 1 mã?")
+    st.caption("Đây là phép thử quan trọng nhất. Một hệ thống lãi ở 1–2 mã là ngẫu nhiên; "
+               "chỉ khi có kỳ vọng dương trên **đa số** mã thì mới là lợi thế thống kê thật sự đáng đặt tiền.")
+    ms1,ms2=st.columns([2,1])
+    ms_scope=ms1.selectbox("Nhóm mã kiểm định",
+        ["Nhóm đại diện (12 mã đa ngành)"]+list(SECTOR_PEERS.keys()),key="ms_scope")
+    ms_days=ms2.selectbox("Lịch sử",[365,500,730],index=1,key="ms_days")
+
+    if st.button("🧪 Chạy kiểm định đa mã", key="btn_multi_bt", use_container_width=True):
+        if ms_scope.startswith("Nhóm đại diện"):
+            syms=["VCB","TCB","VPB","HPG","FPT","MWG","VIC","SSI","GAS","VNM","REE","DHG"]
+        else:
+            syms=SECTOR_PEERS[ms_scope]
+        prog=st.progress(0.0)
+        def _cb(p,s): prog.progress(p,f"Kiểm định {s}... ")
+        with st.spinner("Đang chạy — thao tác này mất vài phút..."):
+            agg,err=backtest_multi_symbol(syms,ms_days,bt_entry,bt_exit,bt_costs,_cb)
+        prog.empty()
+        st.session_state.multi_bt=(agg,err)
+
+    mb=st.session_state.get("multi_bt")
+    if mb:
+        agg,err=mb
+        if err: st.info(err)
+        elif agg:
+            v1,v2,v3,v4=st.columns(4)
+            pp=agg["pct_positive_r"] or 0
+            v1.markdown(metric_html("% mã có kỳ vọng DƯƠNG",f"{pp*100:.0f}%",
+                "#00d97e" if pp>=0.6 else "#f5a623" if pp>=0.45 else "#ff3d5a"),unsafe_allow_html=True)
+            mer=agg["median_expectancy_r"]
+            v2.markdown(metric_html("Expectancy trung vị",f"{mer:+.2f}R" if mer is not None else "—",
+                "#00d97e" if mer and mer>0.2 else "#f5a623" if mer and mer>0 else "#ff3d5a"),unsafe_allow_html=True)
+            v3.markdown(metric_html("Tổng số lệnh",f"{agg['total_trades']}",
+                "#00d97e" if agg['total_trades']>=100 else "#f5a623"),unsafe_allow_html=True)
+            v4.markdown(metric_html("% mã thắng Mua&Giữ",f"{agg['pct_beat_bh']*100:.0f}%"),unsafe_allow_html=True)
+
+            if pp>=0.6 and mer and mer>0.15:
+                st.success(f"✅ **Hệ thống có dấu hiệu lợi thế thật**: kỳ vọng dương trên {pp*100:.0f}% số mã "
+                           f"({agg['n_symbols']} mã, {agg['total_trades']} lệnh). Đây là bằng chứng mạnh hơn nhiều "
+                           "so với backtest một mã đơn lẻ.")
+            elif pp>=0.45:
+                st.warning(f"⚠️ **Lợi thế không rõ ràng**: chỉ {pp*100:.0f}% số mã có kỳ vọng dương — gần với "
+                           "kết quả tung đồng xu. Chưa nên đặt vốn lớn theo hệ thống này; cân nhắc siết bộ lọc "
+                           "hoặc chỉ áp dụng cho nhóm mã mà hệ thống tỏ ra hiệu quả.")
+            else:
+                st.error(f"❌ **Không có lợi thế**: chỉ {pp*100:.0f}% số mã cho kỳ vọng dương. "
+                         "Nếu vẫn giao dịch theo hệ thống này, xác suất cao là anh đang trả phí cho thị trường. "
+                         "Cần xem lại bộ quy tắc, đừng chỉ chỉnh ngưỡng cho tới khi số đẹp.")
+
+            dtl=agg["detail"].copy()
+            dtl_show=pd.DataFrame({
+                "Mã":dtl["sym"],"Lệnh":dtl["n_trades"],
+                "WR":dtl["win_rate"].apply(lambda v:f"{v*100:.0f}%"),
+                "ExpR":dtl["expectancy_r"].apply(lambda v:f"{v:+.2f}R" if pd.notna(v) else "—"),
+                "PF":dtl["profit_factor"].apply(lambda v:f"{v:.2f}" if pd.notna(v) else "—"),
+                "Lãi HT":dtl["strat_return"].apply(lambda v:f"{v*100:+.1f}%"),
+                "Mua&Giữ":dtl["buyhold_return"].apply(lambda v:f"{v*100:+.1f}%"),
+                "MDD":dtl["max_dd"].apply(lambda v:f"{v*100:.0f}%"),
+                "Giữ TB":dtl["avg_bars"].apply(lambda v:f"{v:.0f}p"),
+            })
+            st.dataframe(dtl_show,use_container_width=True,hide_index=True)
+
+            fig_ms=go.Figure(go.Bar(x=dtl["sym"],y=dtl["expectancy_r"],
+                marker_color=["#00d97e" if v>0 else "#ff3d5a" for v in dtl["expectancy_r"].fillna(0)],
+                text=[f"{v:+.2f}" if pd.notna(v) else "" for v in dtl["expectancy_r"]],
+                textposition="outside"))
+            fig_ms.add_hline(y=0,line=dict(color="rgba(255,255,255,.3)",width=1))
+            fig_ms.update_layout(height=280,title="Expectancy (R/lệnh) theo từng mã — càng nhiều cột xanh càng đáng tin",
+                template="plotly_dark",**CHART_STYLE)
+            fig_ms.layout.title.font.color="#8baed4"; fig_ms.layout.title.font.size=12
+            st.plotly_chart(fig_ms,use_container_width=True)
 
     st.markdown("---")
-    st.markdown("#### 6️⃣ Nhật ký lệnh đã đóng — Win Rate / Expectancy / Kelly")
+    # ══ QUẢN TRỊ RỦI RO TOÀN TÀI KHOẢN (tài khoản tiền tươi, không margin) ══
+    st.markdown("---")
+    st.markdown("#### 7️⃣ Quản trị rủi ro toàn tài khoản — Portfolio Heat")
+    st.caption("Rủi ro giết tài khoản không nằm ở một lệnh, mà ở việc nhiều lệnh cùng sai một lúc. "
+               "Mục này cộng dồn rủi ro của TẤT CẢ vị thế đang mở để anh biết nếu mọi thứ chạm stop cùng lúc "
+               "thì tài khoản mất bao nhiêu.")
+    hc1,hc2,hc3=st.columns(3)
+    heat_cap=hc1.number_input("Tổng vốn tài khoản (triệu đ)",value=100.0,step=10.0,key="heat_cap")*1_000_000
+    heat_max=hc2.number_input("Trần rủi ro toàn tài khoản (%)",value=6.0,step=1.0,
+        min_value=1.0,max_value=30.0,key="heat_max",
+        help="Chuẩn phổ biến: tổng rủi ro các lệnh đang mở không vượt 6% tài khoản")
+    heat_maxpos=hc3.number_input("Số vị thế mở tối đa",value=5,step=1,min_value=1,max_value=20,key="heat_maxpos")
+
+    if "heat_positions" not in st.session_state:
+        st.session_state.heat_positions=pd.DataFrame(
+            [{"Mã":"","Khối lượng":0,"Giá vào":0.0,"Giá cắt lỗ":0.0,"Giá hiện tại":0.0}])
+    heat_edit=st.data_editor(st.session_state.heat_positions,num_rows="dynamic",
+        use_container_width=True,key="heat_editor")
+    st.session_state.heat_positions=heat_edit
+
+    if st.button("🔥 Tính Portfolio Heat",key="btn_heat",use_container_width=True):
+        h=heat_edit.copy()
+        for c in ["Khối lượng","Giá vào","Giá cắt lỗ","Giá hiện tại"]:
+            h[c]=pd.to_numeric(h[c],errors="coerce").fillna(0)
+        h=h[(h["Mã"].astype(str).str.strip()!="")&(h["Khối lượng"]>0)&(h["Giá vào"]>0)]
+        if h.empty:
+            st.warning("Nhập ít nhất 1 vị thế đang mở.")
+        else:
+            h["Giá hiện tại"]=h.apply(lambda r: r["Giá hiện tại"] if r["Giá hiện tại"]>0 else r["Giá vào"],axis=1)
+            h["Giá trị"]=h["Khối lượng"]*h["Giá hiện tại"]
+            # Rủi ro còn lại = từ giá HIỆN TẠI xuống stop (rủi ro thực đang gánh)
+            h["Rủi ro (đ)"]=((h["Giá hiện tại"]-h["Giá cắt lỗ"])*h["Khối lượng"]).clip(lower=0)
+            h.loc[h["Giá cắt lỗ"]<=0,"Rủi ro (đ)"]=h["Giá trị"]  # không đặt stop = rủi ro toàn bộ vốn lệnh
+            h["Lãi/lỗ (đ)"]=(h["Giá hiện tại"]-h["Giá vào"])*h["Khối lượng"]
+            h["% TK"]=h["Giá trị"]/heat_cap*100
+            h["Rủi ro %TK"]=h["Rủi ro (đ)"]/heat_cap*100
+            total_val=h["Giá trị"].sum(); total_risk=h["Rủi ro (đ)"].sum()
+            total_pnl=h["Lãi/lỗ (đ)"].sum()
+            heat_pct=total_risk/heat_cap*100; invested_pct=total_val/heat_cap*100
+            no_stop=h[h["Giá cắt lỗ"]<=0]
+            losers=h[h["Lãi/lỗ (đ)"]<0]
+            below_stop=h[(h["Giá cắt lỗ"]>0)&(h["Giá hiện tại"]<h["Giá cắt lỗ"])]
+
+            g1,g2,g3,g4=st.columns(4)
+            g1.markdown(metric_html("Portfolio Heat",f"{heat_pct:.1f}%",
+                "#ff3d5a" if heat_pct>heat_max else "#f5a623" if heat_pct>heat_max*0.75 else "#00d97e"),unsafe_allow_html=True)
+            g2.markdown(metric_html("Tỷ lệ giải ngân",f"{invested_pct:.0f}%",
+                "#f5a623" if invested_pct>90 else "#00d97e"),unsafe_allow_html=True)
+            g3.markdown(metric_html("Số vị thế",f"{len(h)}/{heat_maxpos}",
+                "#ff3d5a" if len(h)>heat_maxpos else "#00d97e"),unsafe_allow_html=True)
+            g4.markdown(metric_html("Lãi/lỗ tạm tính",f"{total_pnl/1e6:+.1f} tr",
+                "#00d97e" if total_pnl>=0 else "#ff3d5a"),unsafe_allow_html=True)
+
+            if heat_pct>heat_max:
+                st.error(f"🔴 **VƯỢT TRẦN RỦI RO** — nếu toàn bộ vị thế chạm cắt lỗ cùng lúc, tài khoản mất "
+                         f"**{total_risk/1e6:.1f} triệu ({heat_pct:.1f}%)**, vượt trần {heat_max:.0f}% anh tự đặt. "
+                         "Cần giảm khối lượng hoặc siết cắt lỗ lại gần hơn trước khi mở thêm lệnh mới.")
+            elif heat_pct>heat_max*0.75:
+                st.warning(f"🟡 Đã dùng {heat_pct/heat_max*100:.0f}% hạn mức rủi ro. "
+                           f"Còn dư địa khoảng {(heat_max-heat_pct):.1f}% cho lệnh mới.")
+            else:
+                st.success(f"🟢 Rủi ro trong tầm kiểm soát — còn dư địa {(heat_max-heat_pct):.1f}% tài khoản "
+                           "để mở thêm vị thế.")
+
+            if len(no_stop)>0:
+                st.error(f"🔴 **{len(no_stop)} vị thế KHÔNG có giá cắt lỗ**: {', '.join(no_stop['Mã'])}. "
+                         "Vị thế không stop nghĩa là rủi ro bằng toàn bộ số vốn đã bỏ vào — "
+                         "đây là cách phổ biến nhất khiến một khoản lỗ nhỏ biến thành khoản lỗ không thể gỡ.")
+            if len(below_stop)>0:
+                st.error(f"⛔ **{len(below_stop)} vị thế ĐÃ THỦNG cắt lỗ mà chưa thoát**: "
+                         f"{', '.join(below_stop['Mã'])}. Kế hoạch chỉ có giá trị khi được thực hiện — "
+                         "giữ tiếp là đang giao dịch bằng hy vọng, không phải bằng hệ thống.")
+            if len(h)>heat_maxpos:
+                st.warning(f"⚠️ Đang mở {len(h)} vị thế, vượt mức {heat_maxpos} mã. "
+                           "Quá nhiều vị thế khiến anh không theo dõi kịp và thực chất là mua cả thị trường.")
+
+            # Cảnh báo tập trung ngành
+            sec_map={}
+            for _,r in h.iterrows():
+                sec=next((s for s,ps in SECTOR_PEERS.items() if str(r["Mã"]).upper() in ps),"Khác")
+                sec_map[sec]=sec_map.get(sec,0)+r["Giá trị"]
+            if total_val>0:
+                top_sec=max(sec_map.items(),key=lambda x:x[1])
+                if top_sec[1]/total_val>0.5 and len(h)>1:
+                    st.warning(f"⚠️ **Tập trung ngành**: {top_sec[1]/total_val*100:.0f}% danh mục nằm trong "
+                               f"ngành **{top_sec[0]}**. Các mã cùng ngành thường cùng lên cùng xuống — "
+                               "anh đang gánh một rủi ro chứ không phải nhiều rủi ro độc lập.")
+
+            disp=h.copy()
+            disp["Giá trị"]=disp["Giá trị"].apply(lambda v:f"{v/1e6:.1f} tr")
+            disp["Rủi ro (đ)"]=disp["Rủi ro (đ)"].apply(lambda v:f"{v/1e6:.2f} tr")
+            disp["Lãi/lỗ (đ)"]=disp["Lãi/lỗ (đ)"].apply(lambda v:f"{v/1e6:+.2f} tr")
+            disp["% TK"]=disp["% TK"].apply(lambda v:f"{v:.1f}%")
+            disp["Rủi ro %TK"]=disp["Rủi ro %TK"].apply(lambda v:f"{v:.2f}%")
+            st.dataframe(disp[["Mã","Khối lượng","Giá vào","Giá cắt lỗ","Giá hiện tại",
+                               "Giá trị","% TK","Rủi ro (đ)","Rủi ro %TK","Lãi/lỗ (đ)"]],
+                         use_container_width=True,hide_index=True)
+            st.caption("Rủi ro tính từ giá HIỆN TẠI xuống cắt lỗ — tức phần anh còn có thể mất từ đây, "
+                       "không phải phần đã lỗ. Vị thế đang lãi và đã kéo stop lên trên giá vào sẽ có rủi ro ~0.")
+
+    st.markdown("---")
+    st.markdown("#### 8️⃣ Nhật ký lệnh đã đóng — Win Rate / Expectancy / Kelly")
     st.caption("Dùng để đánh giá hệ thống giao dịch của Hải Đăng dựa trên các lệnh đã chốt lời/cắt lỗ thực tế.")
     if "trade_log" not in st.session_state:
         st.session_state.trade_log = pd.DataFrame(
@@ -2441,6 +3087,267 @@ with tab8:
                            "hoặc thấp hơn, đặc biệt khi số lệnh trong nhật ký còn ít (<20 lệnh).")
             else:
                 st.info("Cần đủ lệnh thắng và thua để tính Kelly Criterion.")
+
+
+# ══════════════ TAB 9: BẮT ĐÁY HOẢNG LOẠN (CAPITULATION REVERSAL) ══════════════
+with tab9:
+    st.markdown("## 🩸 Bộ giao dịch số 2 — Bắt đáy hoảng loạn")
+    st.markdown("""<div style='background:#1a0c14;border:2px solid #ff3d5a;border-radius:10px;
+      padding:14px 18px;margin:8px 0;font-size:13px;color:#ffd0d8;line-height:1.7;'>
+      <b style='font-size:15px;'>⚠️ ĐỌC TRƯỚC KHI DÙNG</b><br>
+      Đây là chiến lược <b>NGƯỢC HOÀN TOÀN</b> với bộ trend-following ở các tab kia.
+      Nó mua khi giá sụp sâu và mọi người đang bán tháo — nghĩa là rủi ro cao hơn hẳn.<br>
+      • Đây là <b>mean-reversion ngắn hạn</b>: mục tiêu là nhịp hồi về SMA20/SMA50, KHÔNG phải nắm giữ chờ thành uptrend<br>
+      • Win rate thực tế thường chỉ <b>35–45%</b>, bù lại R:R cao<br>
+      • Rủi ro chí mạng: mua xong mã <b>nằm sàn trắng bên mua</b> → cắt lỗ vô nghĩa, cộng T+2 có thể kẹt 3–4 phiên<br>
+      • Chỉ dùng khi thị trường <b>đang giảm mạnh</b>. Trong thị trường bình thường, hãy dùng bộ trend-following.
+    </div>""",unsafe_allow_html=True)
+
+    cs1,cs2,cs3=st.columns(3)
+    cap_min=cs1.number_input("Ngưỡng điểm climax (0–10)",value=6.0,step=0.5,
+        min_value=3.0,max_value=10.0,key="cap_min",
+        help="Điểm càng cao càng ít tín hiệu nhưng chất lượng càng chọn lọc")
+    cap_win=cs2.number_input("Cửa sổ chờ xác nhận (phiên)",value=3,step=1,
+        min_value=1,max_value=7,key="cap_win",
+        help="Sau phiên bán tháo, cho phép bao nhiêu phiên để tín hiệu xác nhận xuất hiện")
+    cap_liq=cs3.number_input("Thanh khoản tối thiểu (tỷ đ/phiên)",value=20.0,step=5.0,
+        min_value=0.0,key="cap_liq",
+        help="Mã thanh khoản thấp rất dễ nằm sàn liên tiếp — đây là bộ lọc sống còn")
+
+    # ── PHẦN 1: Trạng thái mã đang xem ──
+    st.markdown(f"### 1️⃣ Trạng thái hiện tại — {symbol}")
+    cap_sig=calc_capitulation_signal(df,cap_min,int(cap_win))
+    _state_style={
+        "ready":("#00d97e","✅ ĐỦ ĐIỀU KIỆN VÀO LỆNH"),
+        "climax_today":("#f5a623","⏳ CÓ CLIMAX HÔM NAY — CHỜ XÁC NHẬN"),
+        "waiting":("#f5a623","⏳ ĐANG CHỜ NẾN XÁC NHẬN"),
+        "failed":("#ff3d5a","❌ TÍN HIỆU HỎNG — DAO RƠI"),
+        "none":("#8baed4","⚪ CHƯA CÓ TÍN HIỆU"),
+        "no_data":("#8baed4","⚪ THIẾU DỮ LIỆU"),
+    }
+    _c,_lbl=_state_style.get(cap_sig.get("state"),("#8baed4","—"))
+    st.markdown(f"""<div style='background:linear-gradient(135deg,{_c}22,#0c1d2e);
+      border:2px solid {_c};border-radius:12px;padding:16px 20px;margin:8px 0;'>
+      <div style='font-size:24px;font-weight:800;color:{_c};'>{_lbl}</div>
+      <div style='font-size:13px;color:#cce0ff;margin-top:8px;line-height:1.6;'>{cap_sig.get('msg','')}</div>
+      <div style='font-size:12px;color:#6a9cc8;margin-top:6px;'>Điểm climax: <b style='color:{_c};'>{cap_sig.get('score',0):.1f}/10</b></div>
+    </div>""",unsafe_allow_html=True)
+
+    if cap_sig.get("state")=="ready":
+        k1,k2,k3,k4=st.columns(4)
+        k1.markdown(trade_card_html("📗","GIÁ VÀO",f"{cap_sig['entry']:,.0f} đ","Giá đóng cửa phiên xác nhận","#00d97e"),unsafe_allow_html=True)
+        k2.markdown(trade_card_html("🛑","CẮT LỖ",f"{cap_sig['stop']:,.0f} đ",
+            f"Dưới đáy climax · rủi ro {cap_sig['risk_pct']:.1f}%","#ff3d5a"),unsafe_allow_html=True)
+        k3.markdown(trade_card_html("🎯","MỤC TIÊU",f"TP1 {cap_sig['tp1']:,.0f}",
+            f"TP2 {cap_sig['tp2']:,.0f} (SMA50)","#f5a623"),unsafe_allow_html=True)
+        k4.markdown(trade_card_html("⚖️","R:R",f"1 : {cap_sig['rr']:.1f}","Tại mục tiêu SMA20","#22d3ee"),unsafe_allow_html=True)
+
+        if cap_sig['risk_pct']>12:
+            st.warning(f"⚠️ Cắt lỗ cách giá vào tới **{cap_sig['risk_pct']:.1f}%** — đặc thù của lệnh bắt đáy. "
+                       "Khối lượng bắt buộc phải nhỏ tương ứng, nếu không một lệnh sai sẽ phá vỡ tài khoản.")
+        st.markdown("#### 💼 Khối lượng — dùng RỦI RO BẰNG MỘT NỬA lệnh thường")
+        cp1,cp2=st.columns(2)
+        cap_capital=cp1.number_input("Vốn giao dịch (triệu đ)",value=100.0,step=10.0,key="cap_cap")*1_000_000
+        cap_risk=cp2.number_input("Rủi ro lệnh này (% tài khoản)",value=0.5,step=0.25,
+            min_value=0.1,max_value=2.0,key="cap_risk",
+            help="Đề xuất 0.25–0.5% cho lệnh bắt đáy, bằng một nửa lệnh trend-following thông thường")
+        cps=quant_position_size(cap_capital,cap_risk,cap_sig['entry'],cap_sig['stop'],15.0)
+        if cps and cps['lots']>0:
+            z1,z2,z3=st.columns(3)
+            z1.markdown(metric_html("Khối lượng",f"{cps['lots']:,} CP","#00d97e"),unsafe_allow_html=True)
+            z2.markdown(metric_html("Giá trị lệnh",f"{cps['value']/1e6:,.1f} tr đ"),unsafe_allow_html=True)
+            z3.markdown(metric_html("Lỗ tối đa",f"−{cps['risk_amount']/1e6:,.2f} tr đ","#ff3d5a"),unsafe_allow_html=True)
+            st.caption("⚠️ Con số 'lỗ tối đa' chỉ đúng nếu bán được. Nếu mã nằm sàn liên tiếp, "
+                       "khoản lỗ thực tế có thể lớn hơn nhiều — đây là rủi ro không thể phòng bằng stop-loss.")
+
+    if cap_sig.get("detail"):
+        with st.expander("🔬 Phân rã điểm climax"):
+            _lb={"vol_climax":"Khối lượng bán tháo","absorption":"Hấp thụ (CLV + bóng nến)",
+                 "depth":"Độ sâu sụt giảm","extreme":"Cực đoan (RSI/Z-score)",
+                 "exhaustion":"Bên bán kiệt sức","flow_turn":"Dòng tiền quay đầu"}
+            st.dataframe(pd.DataFrame([{"Cấu phần":_lb.get(k,k),"Điểm":f"{v:+.2f}","Diễn giải":t}
+                for k,(t,v) in cap_sig["detail"].items()]),use_container_width=True,hide_index=True)
+            st.caption("**Absorption là cấu phần quyết định.** Khối lượng lớn mà đóng cửa sát đáy = "
+                       "bên bán vẫn thắng (dao rơi). Khối lượng lớn mà đóng cửa nửa trên biên + bóng dưới dài = "
+                       "có lực cầu đủ lớn nuốt hết lượng bán (hấp thụ thật).")
+
+    # ── PHẦN 2: Quét toàn thị trường ──
+    st.markdown("---")
+    st.markdown("### 2️⃣ Quét mã có dấu hiệu hấp thụ")
+    st.caption("Chỉ nên chạy khi thị trường chung đang giảm mạnh. Kiểm tra '% mã trên EMA200' ở Tab Quét mã: "
+               "dưới 40% là môi trường của chiến lược này.")
+    cq1,cq2=st.columns([2,1])
+    cap_scope=cq1.selectbox("Phạm vi quét",
+        ["Toàn bộ danh mục theo dõi"]+list(SECTOR_PEERS.keys()),key="cap_scope")
+    cap_days=cq2.selectbox("Lịch sử",[260,365,500],index=1,key="cap_days")
+
+    if st.button("🔎 Quét mã bắt đáy",key="btn_cap_scan",use_container_width=True):
+        uni=(sorted({s for l in SECTOR_PEERS.values() for s in l})
+             if cap_scope.startswith("Toàn bộ") else SECTOR_PEERS[cap_scope])
+        res=[];prog=st.progress(0.0)
+        for i2,s2 in enumerate(uni):
+            prog.progress((i2+1)/len(uni),f"Quét {s2}... ({i2+1}/{len(uni)})")
+            r=scan_capitulation(s2,cap_days,cap_min,int(cap_win))
+            if r: res.append(r)
+        prog.empty(); st.session_state.cap_scan=res
+
+    cres=st.session_state.get("cap_scan",[])
+    if cres:
+        ready=[r for r in cres if r["state"]=="ready" and r["liquidity_bn"]>=cap_liq]
+        watch=[r for r in cres if r["state"] in ("climax_today","waiting") and r["liquidity_bn"]>=cap_liq]
+        falling=[r for r in cres if r["state"]=="failed"]
+        low_liq=[r for r in cres if r["state"] in ("ready","climax_today","waiting") and r["liquidity_bn"]<cap_liq]
+        ready.sort(key=lambda x:-(x["score"] or 0)); watch.sort(key=lambda x:-(x["score"] or 0))
+        st.caption(f"Đã quét {len(cres)} mã · {len(ready)} sẵn sàng · {len(watch)} đang chờ xác nhận · "
+                   f"{len(falling)} tín hiệu hỏng"
+                   +(f" · {len(low_liq)} bị loại vì thanh khoản thấp" if low_liq else ""))
+
+        if ready:
+            st.markdown("#### ✅ Đủ điều kiện vào lệnh")
+            for r in ready[:8]:
+                st.markdown(
+                    f"<div style='background:#0c1d2e;border:1px solid #163350;border-left:5px solid #00d97e;"
+                    f"border-radius:0 12px 12px 0;padding:13px 17px;margin:7px 0;'>"
+                    f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
+                    f"<span style='font-size:21px;font-weight:800;color:#fff;'>{r['sym']}</span>"
+                    f"<span style='font-size:20px;font-weight:800;color:#00d97e;'>{r['score']:.1f}/10</span>"
+                    f"<span style='color:#fff;'>{r['close']:,.0f}đ</span>"
+                    f"<span style='color:#8baed4;font-size:12px;'>Vol×{r['vol_ratio']:.1f} · RSI {r['rsi']:.0f} · "
+                    f"CLV {r['clv']:+.2f} · sụt {r['dd20']:.0f}% · TK {r['liquidity_bn']:.0f} tỷ</span></div>"
+                    f"<div style='margin-top:7px;font-size:13px;color:#cce0ff;'>"
+                    f"📗 Vào <b>{r['entry']:,.0f}</b> · 🛑 Cắt <b style='color:#ff3d5a;'>{r['stop']:,.0f}</b> "
+                    f"(−{r['risk_pct']:.1f}%) · 🎯 TP1 <b style='color:#f5a623;'>{r['tp1']:,.0f}</b> · "
+                    f"⚖️ 1:{r['rr']:.1f}</div></div>",unsafe_allow_html=True)
+        if watch:
+            st.markdown("#### ⏳ Đang chờ xác nhận (theo dõi, chưa mua)")
+            wt=pd.DataFrame([{"Mã":r["sym"],"Điểm":f"{r['score']:.1f}","Giá":f"{r['close']:,.0f}",
+                "Vol×":f"{r['vol_ratio']:.1f}","RSI":f"{r['rsi']:.0f}","CLV":f"{r['clv']:+.2f}",
+                "Sụt từ đỉnh":f"{r['dd20']:.0f}%","Phiên giảm LT":r["downstreak"],
+                "TK(tỷ)":f"{r['liquidity_bn']:.0f}","Trạng thái":
+                "Climax hôm nay" if r["state"]=="climax_today" else "Chờ nến xanh"} for r in watch[:15]])
+            st.dataframe(wt,use_container_width=True,hide_index=True)
+        if falling:
+            st.markdown("#### ❌ Tín hiệu hỏng — đã thủng đáy climax (TUYỆT ĐỐI KHÔNG MUA)")
+            st.markdown(", ".join(f"**{r['sym']}**" for r in falling[:20]))
+            st.caption("Những mã này từng có phiên bán tháo nhưng giá đã xuyên thủng đáy phiên đó — "
+                       "đúng định nghĩa dao rơi. Đây chính là nhóm mã trông 'rẻ' và hấp dẫn nhất.")
+        if low_liq:
+            st.warning(f"⚠️ {len(low_liq)} mã có tín hiệu nhưng thanh khoản dưới {cap_liq:.0f} tỷ/phiên đã bị loại: "
+                       + ", ".join(r["sym"] for r in low_liq[:12])
+                       + ". Mã thanh khoản thấp rất dễ nằm sàn liên tiếp khiến anh không thoát được.")
+        if not ready and not watch:
+            st.info("Không có mã nào đạt tín hiệu. Trong thị trường bình thường điều này là bình thường — "
+                    "chiến lược bắt đáy chỉ có việc làm khi thị trường thực sự hoảng loạn.")
+    else:
+        st.info("Nhấn **Quét mã bắt đáy** để tìm mã có dấu hiệu bán tháo và hấp thụ.")
+
+    # ── PHẦN 3: Kiểm định ──
+    st.markdown("---")
+    st.markdown("### 3️⃣ Kiểm định chiến lược bắt đáy")
+    st.caption(f"Chạy trên lịch sử **{symbol}** với đầy đủ ma sát VN. Đặc biệt chú ý chỉ số "
+               "**KẸT SÀN** — đây là rủi ro riêng của chiến lược này mà trend-following gần như không gặp.")
+    cb1,cb2,cb3=st.columns(3)
+    cap_hold=cb1.number_input("Giữ tối đa (phiên)",value=15,step=5,min_value=3,max_value=60,key="cap_hold",
+        help="Lệnh mean-reversion phải có giới hạn thời gian — hồi không tới thì thoát, không ôm")
+    cap_lim=cb2.selectbox("Biên độ sàn",["HOSE ±7%","HNX ±10%","UPCOM ±15%"],key="cap_lim")
+    cap_cost=cb3.checkbox("Tính phí & thuế",value=True,key="cap_cost")
+    _lm={"HOSE ±7%":0.07,"HNX ±10%":0.10,"UPCOM ±15%":0.15}
+
+    if st.button("🔬 Chạy kiểm định bắt đáy",key="btn_cap_bt",use_container_width=True):
+        with st.spinner("Đang kiểm định..."):
+            cst,cerr=backtest_capitulation(df,cap_min,int(cap_win),int(cap_hold),
+                price_limit=_lm[cap_lim],apply_costs=cap_cost)
+            st.session_state.cap_bt=(cst,cerr,symbol)
+
+    cbt=st.session_state.get("cap_bt")
+    if cbt and cbt[2]==symbol:
+        cst,cerr,_=cbt
+        if cerr: st.info(f"ℹ️ {cerr}")
+        elif cst:
+            y1,y2,y3,y4=st.columns(4)
+            y1.markdown(metric_html("Số lệnh",f"{cst['n_trades']}",
+                "#00d97e" if cst['n_trades']>=20 else "#f5a623"),unsafe_allow_html=True)
+            y2.markdown(metric_html("Win Rate",f"{cst['win_rate']*100:.0f}%",
+                "#00d97e" if cst['win_rate']>0.4 else "#f5a623"),unsafe_allow_html=True)
+            cer=cst['expectancy_r']
+            y3.markdown(metric_html("Expectancy (R)",f"{cer:+.2f}R" if cer is not None else "—",
+                "#00d97e" if cer and cer>0.2 else "#ff3d5a"),unsafe_allow_html=True)
+            y4.markdown(metric_html("Lãi ròng",f"{cst['strat_return']*100:+.1f}%",
+                "#00d97e" if cst['strat_return']>0 else "#ff3d5a"),unsafe_allow_html=True)
+            y5,y6,y7,y8=st.columns(4)
+            y5.markdown(metric_html("Max Drawdown",f"{cst['max_dd']*100:.1f}%","#ff3d5a"),unsafe_allow_html=True)
+            y6.markdown(metric_html("Lệnh tệ nhất",f"{cst['worst_trade']*100:.1f}%","#ff3d5a"),unsafe_allow_html=True)
+            y7.markdown(metric_html("Giữ TB",f"{cst['avg_bars_held']:.0f} phiên"),unsafe_allow_html=True)
+            y8.markdown(metric_html("KẸT SÀN / kẹt T+2",
+                f"{cst['blocked_floor']} / {cst['blocked_tplus']}",
+                "#ff3d5a" if cst['blocked_floor']>0 else "#8baed4"),unsafe_allow_html=True)
+
+            vd=[]
+            if cst['blocked_floor']>0:
+                vd.append(("#ff3d5a",f"🔴 **{cst['blocked_floor']} lần hệ thống muốn bán nhưng mã NẰM SÀN "
+                    "không thoát được.** Đây là rủi ro thật, không phải lý thuyết — cắt lỗ trên giấy không "
+                    "cứu được anh khi không có bên mua."))
+            if cst['failed_signals']>0:
+                vd.append(("#f5a623",f"⚠️ {cst['failed_signals']} tín hiệu bị loại vì giá thủng đáy climax "
+                    "(dao rơi). Bộ lọc xác nhận đã làm đúng việc của nó — nếu không có nó, "
+                    f"anh đã vào {cst['failed_signals']} lệnh sai."))
+            if cst['n_trades']<20:
+                vd.append(("#f5a623",f"⚠️ Chỉ {cst['n_trades']} lệnh — climax là sự kiện hiếm nên mẫu luôn nhỏ. "
+                    "Đây là hạn chế cố hữu của chiến lược này: rất khó chứng minh thống kê."))
+            if cer is not None and cer>0.2:
+                vd.append(("#00d97e",f"✅ Kỳ vọng dương sau phí ({cer:+.2f}R) — nhưng nhớ nhìn 'lệnh tệ nhất' "
+                    f"({cst['worst_trade']*100:.1f}%) để biết cú đau nhất trông như thế nào."))
+            elif cer is not None:
+                vd.append(("#ff3d5a",f"❌ Kỳ vọng {cer:+.2f}R — không đủ bù rủi ro. Không nên áp dụng chiến lược "
+                    "bắt đáy cho mã này."))
+            for c_,t_ in vd:
+                st.markdown(f"<div style='background:#0c1d2e;border-left:4px solid {c_};border-radius:0 8px 8px 0;"
+                    f"padding:10px 14px;margin:6px 0;font-size:13px;color:#cce0ff;line-height:1.6;'>{t_}</div>",
+                    unsafe_allow_html=True)
+
+            with st.expander("📋 Chi tiết từng lệnh"):
+                ct=cst['trades'].copy()
+                ct["Ngày vào"]=pd.to_datetime(ct["entry_date"]).dt.strftime("%d/%m/%Y")
+                ct["Ngày ra"]=pd.to_datetime(ct["exit_date"]).dt.strftime("%d/%m/%Y")
+                ct["Giá vào"]=ct["entry"].apply(lambda v:f"{v:,.0f}")
+                ct["Giá ra"]=ct["exit"].apply(lambda v:f"{v:,.0f}")
+                ct["Lãi ròng"]=ct["pnl_pct"].apply(lambda v:f"{v*100:+.1f}%")
+                ct["R"]=ct["r_multiple"].apply(lambda v:f"{v:+.2f}R" if pd.notna(v) else "—")
+                st.dataframe(ct[["Ngày vào","Ngày ra","bars_held","Giá vào","Giá ra","Lãi ròng","R","reason"]]
+                    .rename(columns={"bars_held":"Phiên giữ","reason":"Lý do thoát"}),
+                    use_container_width=True,hide_index=True)
+
+    # ── PHẦN 4: Hướng dẫn ──
+    with st.expander("📖 Hướng dẫn sử dụng bộ giao dịch số 2"):
+        st.markdown("""
+**Khi nào dùng bộ này thay vì trend-following**
+
+Kiểm tra `% mã trên EMA200` ở Tab Quét mã:
+- **>60%** → dùng trend-following (Tab Kỹ thuật), KHÔNG dùng tab này
+- **40–60%** → thị trường phân hoá, cả hai bộ đều khó, giảm tỷ trọng
+- **<40%** → môi trường của tab này
+
+**Quy trình 6 bước**
+
+1. Xác nhận thị trường đang giảm mạnh (breadth <40%)
+2. Chờ VN-Index ổn định trước — **không bắt đáy cổ phiếu khi chỉ số còn đang cascade giải chấp**
+3. Quét mã ở phần 2, chỉ lấy nhóm "Đủ điều kiện", bỏ qua nhóm "Tín hiệu hỏng"
+4. Kiểm định mã đó ở phần 3 — nếu kỳ vọng âm hoặc có kẹt sàn nhiều thì bỏ
+5. Vào lệnh với rủi ro **0.25–0.5%** tài khoản (bằng nửa lệnh thường)
+6. Chốt tại SMA20/SMA50, **không ôm chờ thành uptrend**. Hết 15 phiên không hồi thì thoát.
+
+**Ba lỗi khiến người ta mất tiền với chiến lược này**
+
+- **Mua ngay phiên climax** thay vì chờ xác nhận. App chặn việc này bằng trạng thái `climax_today`.
+- **Mua mã thanh khoản thấp** vì thấy giảm nhiều nhất. Đó chính là nhóm dễ nằm sàn liên tiếp nhất.
+- **Biến lệnh bắt đáy thành khoản đầu tư dài hạn** khi nó không hồi. Đây là mean-reversion, có hạn sử dụng.
+
+**Điều app không làm được**
+
+App không biết mã đang có tin xấu cơ bản hay không. Một mã sụp 30% vì lãnh đạo bị bắt hay vì gian lận
+báo cáo tài chính sẽ có đủ mọi dấu hiệu "climax" nhưng không bao giờ hồi. **Luôn kiểm tra tin tức
+(Tab Tin tức) trước khi bắt đáy bất kỳ mã nào.**
+        """)
 
 if auto_r:
     time.sleep(ref_sec)
