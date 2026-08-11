@@ -443,6 +443,11 @@ def scan_stock_quant(sym, days=260, _vni_close=None):
         ema200 = float(lat.EMA200) if pd.notna(lat.get("EMA200")) else None
         # Thanh khoản trung bình 20 phiên (giá trị giao dịch, tỷ đồng) — lọc mã quá mỏng
         liq = float((d["Close"].tail(20)*d["Volume"].tail(20)).mean()/1e9)
+        # Vị trí so với đỉnh/đáy 52 tuần (~250 phiên) — dùng cho breadth thị trường
+        _w = d.tail(250)
+        _h52 = float(_w["High"].max()); _l52 = float(_w["Low"].min())
+        pct_h52 = (c/_h52-1)*100 if _h52 > 0 else None
+        pct_l52 = (c/_l52-1)*100 if _l52 > 0 else None
 
         return dict(
             sym=sym, close=c, quant_score=qd["score"], action=qd["action"], color=qd["color"],
@@ -459,6 +464,7 @@ def scan_stock_quant(sym, days=260, _vni_close=None):
             above_ema200=(ema200 is not None and c > ema200 and len(d) >= 180),
         ema200_ready=(len(d) >= 180),
             rs_slope=rs_slope, rs_val=rs_val, liquidity_bn=liq,
+            pct_from_52w_high=pct_h52, pct_from_52w_low=pct_l52,
             detail=qd["detail"],
         )
     except Exception:
@@ -1442,6 +1448,395 @@ def scan_capitulation(sym, days=365, min_score=6.0, confirm_window=3):
     except Exception:
         return None
 
+
+# ══════════════════ NHÓM A: KIỂM ĐỊNH PHƯƠNG PHÁP & XẾP HẠNG CẮT NGANG ══════════════════
+# Toàn bộ phần này là TÍNH TOÁN THUẦN trên dữ liệu app đã có — không thêm nguồn dữ liệu mới.
+
+# ── A8: Kiểm tra toàn vẹn dữ liệu ────────────────────────────────────────────
+def data_quality_report(df, price_limit=0.07):
+    """Soát lỗi dữ liệu TRƯỚC khi phân tích. Trả về (danh sách vấn đề, mức độ nặng nhất).
+    Đây là lớp đã thiếu và gây ra lệnh sai ở ngày giao dịch không hưởng quyền."""
+    issues = []
+    if df is None or df.empty:
+        return [dict(level="critical", msg="Không có dữ liệu giá")], "critical"
+    n = len(df)
+    # 1. Gap vượt biên độ → gần như chắc chắn là ngày GDKHQ chưa điều chỉnh
+    try:
+        chg = df["Close"].pct_change()
+        big = chg[abs(chg) > price_limit*1.5]
+        for idx in big.index[-3:]:
+            issues.append(dict(level="critical",
+                msg=f"Biến động {chg[idx]*100:+.0f}% ngày {pd.to_datetime(df.loc[idx,'Date']).strftime('%d/%m/%Y')} "
+                    f"— vượt xa biên độ ±{price_limit*100:.0f}%. Nhiều khả năng là ngày giao dịch không hưởng quyền "
+                    "(cổ tức bằng cổ phiếu / cổ phiếu thưởng / chia tách) mà dữ liệu CHƯA điều chỉnh hồi tố."))
+    except Exception: pass
+    # 2. Giá đứng im nhiều phiên → mã đình chỉ hoặc dữ liệu lặp
+    try:
+        same = (df["Close"].diff() == 0).astype(int)
+        run = 0; mx = 0
+        for v in same:
+            run = run+1 if v else 0; mx = max(mx, run)
+        if mx >= 5:
+            issues.append(dict(level="critical" if mx >= 10 else "warning",
+                msg=f"Giá không đổi suốt {mx} phiên liên tiếp — mã có thể bị đình chỉ giao dịch "
+                    "hoặc dữ liệu bị lặp. Mọi chỉ báo đều không đáng tin."))
+    except Exception: pass
+    # 3. Phiên không có khối lượng
+    try:
+        zv = int((df["Volume"] <= 0).sum())
+        if zv > 0:
+            issues.append(dict(level="warning" if zv < n*0.05 else "critical",
+                msg=f"{zv}/{n} phiên có khối lượng bằng 0 ({zv/n*100:.0f}%) — thanh khoản gián đoạn."))
+    except Exception: pass
+    # 4. Giá phi lý
+    try:
+        bad = int(((df["Close"] <= 0) | (df["High"] < df["Low"]) |
+                   (df["Close"] > df["High"]) | (df["Close"] < df["Low"])).sum())
+        if bad > 0:
+            issues.append(dict(level="critical",
+                msg=f"{bad} phiên có giá phi lý (giá ≤ 0, hoặc High < Low, hoặc Close nằm ngoài khoảng High-Low)."))
+    except Exception: pass
+    # 5. Khoảng trống thời gian bất thường
+    try:
+        d = pd.to_datetime(df["Date"]).sort_values()
+        gaps = d.diff().dt.days.dropna()
+        long_gaps = int((gaps > 12).sum())
+        if long_gaps > 0:
+            issues.append(dict(level="warning",
+                msg=f"{long_gaps} lần dữ liệu bị đứt quãng trên 12 ngày — có thể thiếu phiên hoặc mã tạm ngừng."))
+    except Exception: pass
+    # 6. Dữ liệu quá ngắn cho bộ lọc dài hạn
+    if n < 180:
+        issues.append(dict(level="warning",
+            msg=f"Chỉ có {n} phiên — dưới 180 phiên nên bộ lọc xu hướng dài hạn (EMA200) bị vô hiệu."))
+    lvl = "critical" if any(i["level"]=="critical" for i in issues) else \
+          ("warning" if issues else "ok")
+    return issues, lvl
+
+# ── A1: Xếp hạng cắt ngang + trung hoà ngành ─────────────────────────────────
+def add_cross_sectional_ranks(results, sector_map=None):
+    """Chuyển điểm TUYỆT ĐỐI thành XẾP HẠNG PHẦN TRĂM trong vũ trụ mã.
+    Lý do: điểm tuyệt đối trôi theo chế độ thị trường (ngưỡng 2.5 quá dễ khi bull,
+    quá khó khi bear) và khiến cả một ngành cùng lọt bộ lọc → tưởng đa dạng hoá
+    nhưng thực chất là một khoản đặt cược."""
+    if not results: return results
+    df = pd.DataFrame(results)
+    if "quant_score" not in df.columns: return results
+    # Percentile toàn thị trường (0-100, càng cao càng mạnh)
+    df["pct_rank"] = df["quant_score"].rank(pct=True)*100
+    # Gán ngành
+    def _sec(s):
+        if sector_map and s in sector_map: return sector_map[s]
+        return next((k for k, v in SECTOR_PEERS.items() if s in v), "Khác")
+    df["sector"] = df["sym"].apply(_sec)
+    # Percentile TRONG NGÀNH — so mã với chính các mã cùng ngành
+    df["sector_rank"] = df.groupby("sector")["quant_score"].rank(pct=True)*100
+    # Điểm trung hoà ngành: trừ đi trung vị ngành → loại bỏ phần "cả ngành cùng lên"
+    df["sector_median"] = df.groupby("sector")["quant_score"].transform("median")
+    df["neutral_score"] = df["quant_score"] - df["sector_median"]
+    df["sector_size"] = df.groupby("sector")["sym"].transform("count")
+    # Ngành chỉ có 1-2 mã thì trung hoà vô nghĩa
+    df.loc[df["sector_size"] < 3, ["sector_rank","neutral_score"]] = [np.nan, np.nan]
+    return df.to_dict("records")
+
+def sector_strength_table(results):
+    """Sức mạnh từng ngành — để biết tiền đang chảy vào đâu và tránh dồn 1 ngành."""
+    if not results: return pd.DataFrame()
+    df = pd.DataFrame(results)
+    if "sector" not in df.columns or "quant_score" not in df.columns: return pd.DataFrame()
+    g = df.groupby("sector").agg(
+        so_ma=("sym","count"), diem_tb=("quant_score","mean"),
+        diem_trung_vi=("quant_score","median"),
+        pct_tren_ema200=("above_ema200", lambda s: float(np.mean([bool(x) for x in s]))*100),
+    ).reset_index().sort_values("diem_trung_vi", ascending=False)
+    return g
+
+# ── A2: Median P/E ngành TÍNH ĐỘNG (thay hằng số cứng) ───────────────────────
+def dynamic_sector_pe(pe_by_symbol, sector):
+    """Tính median P/E ngành từ DỮ LIỆU THỰC thay vì hằng số viết cứng trong code.
+    pe_by_symbol: dict {mã: P/E}. Trả về (median, số mã dùng để tính, nguồn)."""
+    peers = SECTOR_PEERS.get(sector, [])
+    vals = [v for s, v in (pe_by_symbol or {}).items()
+            if s in peers and v is not None and 0 < v < 100]
+    if len(vals) >= 3:
+        return float(np.median(vals)), len(vals), "Tính động từ dữ liệu thực"
+    fb = SECTOR_PE.get(sector)
+    return (float(fb) if fb else None), len(vals), \
+           f"Hằng số tham chiếu (chỉ có {len(vals)} mã có P/E hợp lệ, cần ≥3 để tính động)"
+
+# ── A3: Walk-forward — tách train/test chống in-sample bias ──────────────────
+def walk_forward_backtest(df, train_ratio=0.6, entry_grid=None, exit_score=-1.0,
+                          apply_costs=True, **kw):
+    """Chọn tham số trên nửa ĐẦU lịch sử, rồi kiểm định trên nửa SAU (dữ liệu chưa từng thấy).
+    Backtest thông thường chọn tham số và kiểm định trên CÙNG dữ liệu → luôn đẹp giả tạo.
+    Chênh lệch giữa train và test chính là mức độ overfit."""
+    if df is None or len(df) < 250:
+        return None, "Cần tối thiểu ~250 phiên để tách train/test có ý nghĩa"
+    entry_grid = entry_grid or [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+    split = int(len(df)*train_ratio)
+    train = df.iloc[:split].reset_index(drop=True)
+    test = df.iloc[split:].reset_index(drop=True)
+    if len(train) < 120 or len(test) < 100:
+        return None, "Không đủ dữ liệu ở một trong hai giai đoạn"
+    # 1. Chọn ngưỡng tốt nhất TRÊN TRAIN
+    train_rows = []
+    for e in entry_grid:
+        s, _ = backtest_quant_signal(train, e, exit_score, apply_costs=apply_costs, **kw)
+        if s and s["n_trades"] >= 3 and s["expectancy_r"] is not None:
+            train_rows.append(dict(entry=e, er=s["expectancy_r"], n=s["n_trades"],
+                                   ret=s["strat_return"]))
+    if not train_rows:
+        return None, "Giai đoạn train không phát sinh đủ lệnh để chọn tham số"
+    tdf = pd.DataFrame(train_rows)
+    best = tdf.loc[tdf["er"].idxmax()]
+    best_entry = float(best["entry"])
+    # 2. Áp ngưỡng đó lên TEST (chưa từng dùng để chọn)
+    ts, terr = backtest_quant_signal(test, best_entry, exit_score, apply_costs=apply_costs, **kw)
+    if ts is None:
+        return None, f"Ngưỡng {best_entry:+.1f} chọn từ train không phát sinh lệnh nào ở test — {terr}"
+    degradation = None
+    if ts["expectancy_r"] is not None:
+        degradation = ts["expectancy_r"] - float(best["er"])
+    return dict(best_entry=best_entry, train_er=float(best["er"]), train_n=int(best["n"]),
+                train_ret=float(best["ret"]), test_er=ts["expectancy_r"], test_n=ts["n_trades"],
+                test_ret=ts["strat_return"], test_wr=ts["win_rate"], test_dd=ts["max_dd"],
+                test_bh=ts["buyhold_return"], degradation=degradation,
+                train_table=tdf, split_date=df["Date"].iloc[split], test_stats=ts), None
+
+# ── A4: Bản đồ nhạy tham số ──────────────────────────────────────────────────
+def parameter_sensitivity(df, entry_grid=None, exit_grid=None, apply_costs=True, **kw):
+    """Quét lưới ngưỡng vào × ngưỡng thoát. Edge THẬT thì cả vùng lân cận đều dương;
+    edge GIẢ chỉ đẹp ở đúng một điểm và xấu ngay xung quanh."""
+    entry_grid = entry_grid or [1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+    exit_grid = exit_grid or [1.0, 0.0, -1.0, -2.0, -3.0]
+    rows = []
+    for e in entry_grid:
+        for x in exit_grid:
+            s, _ = backtest_quant_signal(df, e, x, apply_costs=apply_costs, **kw)
+            rows.append(dict(entry=e, exit=x,
+                             er=(s["expectancy_r"] if s and s["expectancy_r"] is not None else np.nan),
+                             n=(s["n_trades"] if s else 0),
+                             ret=(s["strat_return"] if s else np.nan)))
+    g = pd.DataFrame(rows)
+    valid = g["er"].dropna()
+    if len(valid) == 0:
+        return None, "Không ô nào phát sinh đủ lệnh"
+    stability = float((valid > 0).mean())
+    return dict(grid=g, stability=stability, median_er=float(valid.median()),
+                best=g.loc[g["er"].idxmax()] if g["er"].notna().any() else None,
+                entry_grid=entry_grid, exit_grid=exit_grid), None
+
+# ── A5: Monte Carlo trên chuỗi lệnh ──────────────────────────────────────────
+def monte_carlo_trades(pnl_series, n_sims=2000, seed=42):
+    """Xáo trộn thứ tự lệnh nhiều lần. Đường vốn thực tế chỉ là MỘT trong vô số
+    thứ tự có thể xảy ra — Monte Carlo cho thấy cú drawdown tệ nhất mà anh CÓ THỂ gặp,
+    không chỉ cú đã tình cờ xảy ra."""
+    p = pd.Series(pnl_series).dropna().values
+    if len(p) < 5: return None, "Cần tối thiểu 5 lệnh"
+    rng = np.random.default_rng(seed)
+    finals = np.empty(n_sims); dds = np.empty(n_sims)
+    m = len(p)
+    for i in range(n_sims):
+        # LẤY MẪU CÓ HOÀN LẠI (bootstrap), KHÔNG phải xáo trộn thứ tự.
+        # Xáo trộn thứ tự không đổi lợi nhuận cuối (phép nhân có tính giao hoán) —
+        # chỉ đổi hình dạng đường vốn. Muốn có phân phối kết quả thật phải bốc lại mẫu.
+        s = rng.choice(p, size=m, replace=True)
+        eq = np.cumprod(1+s)
+        finals[i] = eq[-1]-1
+        peak = np.maximum.accumulate(eq)
+        dds[i] = float(((eq-peak)/peak).min())
+    return dict(n_trades=len(p), n_sims=n_sims,
+                ret_median=float(np.median(finals)),
+                ret_p05=float(np.percentile(finals,5)), ret_p95=float(np.percentile(finals,95)),
+                dd_median=float(np.median(dds)), dd_p05=float(np.percentile(dds,5)),
+                dd_worst=float(dds.min()),
+                prob_loss=float((finals<0).mean()),
+                prob_dd_20=float((dds<-0.20).mean()),
+                prob_dd_30=float((dds<-0.30).mean()),
+                finals=finals, dds=dds), None
+
+# ── A7: Breadth thị trường thật ──────────────────────────────────────────────
+def market_breadth(results):
+    """Bức tranh thị trường tính từ chính dữ liệu đã quét, thay cho breadth thô."""
+    if not results: return None
+    df = pd.DataFrame(results)
+    n = len(df)
+    out = dict(n=n)
+    out["pct_above_ema200"] = float(np.mean([bool(x) for x in df.get("above_ema200",[])]))*100 if "above_ema200" in df else None
+    if "chg1d" in df:
+        adv = int((df["chg1d"]>0).sum()); dec = int((df["chg1d"]<0).sum())
+        out.update(advancers=adv, decliners=dec, ad_ratio=(adv/dec if dec else float("inf")))
+    if "pct_from_52w_high" in df:
+        out["new_high_52w"] = int((df["pct_from_52w_high"]>=-1).sum())
+        out["near_low_52w"] = int((df["pct_from_52w_low"]<=1).sum()) if "pct_from_52w_low" in df else None
+    if "liquidity_bn" in df:
+        out["total_liquidity_bn"] = float(df["liquidity_bn"].sum())
+        out["median_liquidity_bn"] = float(df["liquidity_bn"].median())
+    if "quant_score" in df:
+        out["avg_score"] = float(df["quant_score"].mean())
+        out["median_score"] = float(df["quant_score"].median())
+    if "breakout" in df:
+        out["n_breakout"] = int(sum(bool(x) for x in df["breakout"]))
+    # Phân loại chế độ thị trường
+    b = out.get("pct_above_ema200") or 0; a = out.get("avg_score") or 0
+    if b > 60 and a > 1:      out["regime"], out["regime_color"] = "THUẬN LỢI cho trend-following", "#00d97e"
+    elif b < 40 or a < -1:    out["regime"], out["regime_color"] = "BẤT LỢI — ưu tiên tiền mặt / bộ bắt đáy", "#ff3d5a"
+    else:                     out["regime"], out["regime_color"] = "PHÂN HOÁ — chọn lọc, giảm tỷ trọng", "#f5a623"
+    return out
+
+
+
+# ── A6: Backtest CẤP DANH MỤC (vốn hữu hạn, giới hạn vị thế, trần rủi ro) ─────
+def portfolio_backtest(price_data, entry_score=2.5, exit_score=-1.0, capital=100e6,
+                       risk_pct=1.0, max_positions=5, max_weight_pct=20.0,
+                       max_heat_pct=6.0, warmup=200, apply_costs=True,
+                       t_plus=VN_T_PLUS, price_limit=0.07, sector_cap=2):
+    """Mô phỏng giao dịch THẬT trên nhiều mã cùng lúc với vốn hữu hạn.
+    Backtest từng mã riêng lẻ giả định vốn vô hạn và bỏ qua việc phải CHỌN
+    giữa các tín hiệu cùng lúc — đó là lý do nó luôn đẹp hơn thực tế.
+
+    price_data: dict {mã: DataFrame đã add_indicators}
+    """
+    if not price_data: return None, "Không có dữ liệu"
+    # Trục thời gian chung
+    common = None
+    for sym, d in price_data.items():
+        # Chuẩn hoá về NGÀY (bỏ giờ/phút) — nguồn dữ liệu có thể kèm dấu thời gian
+        # khác nhau giữa các mã khiến phép giao tập hợp trả về rỗng.
+        dates = pd.to_datetime(d["Date"]).dt.normalize()
+        common = dates if common is None else common[common.isin(dates)]
+    if common is None or len(common) < warmup+60:
+        return None, f"Không đủ phiên chung giữa các mã (cần ≥{warmup+60}, có {0 if common is None else len(common)})"
+    common = pd.Series(sorted(common.unique()))
+    # Chuẩn hoá + chấm điểm trước cho toàn bộ
+    d_by = {}
+    for sym, d in price_data.items():
+        dd = d.copy(); dd["Date"] = pd.to_datetime(dd["Date"]).dt.normalize()
+        dd = dd.drop_duplicates(subset="Date", keep="last")
+        dd = dd[dd["Date"].isin(common)].sort_values("Date").reset_index(drop=True)
+        scores = [np.nan]*len(dd)
+        for i in range(warmup, len(dd)):
+            scores[i], _ = quant_row_score(dd.iloc[i])
+        dd["QS"] = scores
+        d_by[sym] = dd
+    n_bars = min(len(v) for v in d_by.values())
+    fb, fs, tx, sl = (0.0015,0.0015,0.001,0.001) if apply_costs else (0,0,0,0)
+
+    cash = capital; positions = {}; trades = []; equity_curve = []
+    rejected_heat = 0; rejected_slots = 0; rejected_sector = 0
+
+    def _sector(s): return next((k for k,v in SECTOR_PEERS.items() if s in v), "Khác")
+
+    for i in range(warmup, n_bars-1):
+        date = d_by[list(d_by)[0]]["Date"].iloc[i]
+        # ── 1. Xử lý thoát ──
+        for sym in list(positions):
+            d = d_by[sym]; row = d.iloc[i]; nxt = d.iloc[i+1]
+            pos = positions[sym]
+            qs = row["QS"]
+            hit_stop = float(row.Close) < pos["stop"]
+            weak = (not pd.isna(qs)) and qs <= exit_score
+            if not (hit_stop or weak): 
+                ch = float(row.Chandelier_Long) if pd.notna(row.get("Chandelier_Long")) else None
+                if ch is not None and ch > pos["stop"]: pos["stop"] = ch
+                continue
+            if i+1 - pos["bar"] < t_plus: continue                 # kẹt T+2
+            prev_c = float(row.Close); nxt_o = float(nxt.Open)
+            if nxt_o <= prev_c*(1-price_limit)+1e-9: continue       # mã sàn, không bán được
+            exit_px = nxt_o*(1-sl)
+            proceeds = pos["shares"]*exit_px*(1-fs-tx)
+            cash += proceeds
+            cost_in = pos["shares"]*pos["entry"]*(1+fb)
+            trades.append(dict(sym=sym, entry_date=pos["date"], exit_date=nxt["Date"],
+                entry=pos["entry"], exit=exit_px, shares=pos["shares"],
+                pnl=proceeds-cost_in, pnl_pct=(proceeds-cost_in)/cost_in,
+                bars_held=i+1-pos["bar"],
+                r_multiple=((proceeds-cost_in)/(pos["shares"]*pos["init_risk"]))
+                           if pos["init_risk"]>0 else np.nan,
+                reason="Chạm stop" if hit_stop else "Điểm suy yếu"))
+            del positions[sym]
+
+        # ── 2. Xét vào lệnh mới — CHỌN mã điểm cao nhất khi có nhiều tín hiệu ──
+        cands = []
+        for sym, d in d_by.items():
+            if sym in positions: continue
+            qs = d["QS"].iloc[i]
+            if pd.isna(qs) or qs < entry_score: continue
+            cands.append((sym, qs))
+        cands.sort(key=lambda x: -x[1])
+        for sym, qs in cands:
+            if len(positions) >= max_positions: rejected_slots += 1; continue
+            d = d_by[sym]; row = d.iloc[i]; nxt = d.iloc[i+1]
+            prev_c = float(row.Close); nxt_o = float(nxt.Open)
+            if nxt_o >= prev_c*(1+price_limit)-1e-9: continue      # mã trần, không mua được
+            # Trần số mã cùng ngành
+            sec = _sector(sym)
+            if sum(1 for s2 in positions if _sector(s2)==sec) >= sector_cap:
+                rejected_sector += 1; continue
+            entry = nxt_o*(1+sl)
+            atr = float(row.ATR) if pd.notna(row.get("ATR")) else entry*0.02
+            ch = float(row.Chandelier_Long) if pd.notna(row.get("Chandelier_Long")) else None
+            stop = max([x for x in [ch, entry-2.5*atr] if x is not None and x < entry], default=entry-2*atr)
+            stop = min(stop, entry-1.0*atr)
+            if stop >= entry: continue
+            init_risk = entry-stop
+            # Kích thước theo rủi ro
+            equity_now = cash + sum(p["shares"]*float(d_by[s2]["Close"].iloc[i]) for s2,p in positions.items())
+            shares = (equity_now*risk_pct/100)/init_risk
+            shares = min(shares, equity_now*max_weight_pct/100/entry)
+            shares = int(shares//100)*100
+            if shares <= 0: continue
+            cost = shares*entry*(1+fb)
+            if cost > cash: 
+                shares = int((cash/(entry*(1+fb)))//100)*100
+                if shares <= 0: continue
+                cost = shares*entry*(1+fb)
+            # Trần tổng rủi ro danh mục
+            open_risk = sum(p["shares"]*max(float(d_by[s2]["Close"].iloc[i])-p["stop"],0)
+                            for s2,p in positions.items())
+            if (open_risk + shares*init_risk)/equity_now*100 > max_heat_pct:
+                rejected_heat += 1; continue
+            cash -= cost
+            positions[sym] = dict(shares=shares, entry=entry, stop=stop, bar=i+1,
+                                  date=nxt["Date"], init_risk=init_risk)
+
+        # ── 3. Ghi nhận giá trị danh mục ──
+        mv = sum(p["shares"]*float(d_by[s2]["Close"].iloc[i]) for s2,p in positions.items())
+        equity_curve.append(dict(Date=date, equity=cash+mv, cash=cash,
+                                 n_pos=len(positions), invested_pct=(mv/(cash+mv)*100) if (cash+mv)>0 else 0))
+
+    # Đóng vị thế còn lại
+    for sym, pos in list(positions.items()):
+        d = d_by[sym]; last = d.iloc[n_bars-1]
+        exit_px = float(last.Close)*(1-sl)
+        proceeds = pos["shares"]*exit_px*(1-fs-tx)
+        cost_in = pos["shares"]*pos["entry"]*(1+fb); cash += proceeds
+        trades.append(dict(sym=sym, entry_date=pos["date"], exit_date=last["Date"],
+            entry=pos["entry"], exit=exit_px, shares=pos["shares"],
+            pnl=proceeds-cost_in, pnl_pct=(proceeds-cost_in)/cost_in,
+            bars_held=n_bars-1-pos["bar"],
+            r_multiple=((proceeds-cost_in)/(pos["shares"]*pos["init_risk"])) if pos["init_risk"]>0 else np.nan,
+            reason="Đóng cuối kỳ"))
+
+    if not trades: return None, "Không phát sinh lệnh nào trong giai đoạn kiểm định"
+    eq = pd.DataFrame(equity_curve)
+    tdf = pd.DataFrame(trades)
+    final = float(eq["equity"].iloc[-1]) if len(eq) else capital
+    ret = final/capital-1
+    peak = eq["equity"].cummax(); dd = float(((eq["equity"]-peak)/peak).min())
+    daily = eq["equity"].pct_change().dropna()
+    sharpe = sharpe_ratio(daily) if len(daily) > 20 else None
+    wins = tdf[tdf["pnl"] > 0]
+    # Mua & nắm giữ đều tay toàn bộ vũ trụ để đối chứng
+    bh = np.mean([float(d["Close"].iloc[n_bars-1]/d["Close"].iloc[warmup]-1) for d in d_by.values()])
+    return dict(final_equity=final, total_return=ret, max_dd=dd, sharpe=sharpe,
+                n_trades=len(tdf), win_rate=len(wins)/len(tdf),
+                expectancy_r=float(tdf["r_multiple"].mean()) if tdf["r_multiple"].notna().any() else None,
+                avg_positions=float(eq["n_pos"].mean()), avg_invested=float(eq["invested_pct"].mean()),
+                equity=eq, trades=tdf, buyhold_equal=float(bh),
+                rejected_heat=rejected_heat, rejected_slots=rejected_slots,
+                rejected_sector=rejected_sector, n_symbols=len(d_by), n_bars=n_bars-warmup), None
+
 # ══════════════════════════════ QUANT PORTFOLIO METRICS ════════════════════════
 def sharpe_ratio(daily_returns: pd.Series, rf_annual: float = 0.03, periods: int = 252):
     if daily_returns is None or len(daily_returns) < 5: return None
@@ -1904,6 +2299,18 @@ except Exception as _e:
 for _a in _data_alerts:
     st.warning(f"⚠️ **DỮ LIỆU BẤT THƯỜNG** — {_a}")
 
+# ── A8: Báo cáo toàn vẹn dữ liệu (chạy trước mọi phân tích) ──
+try:
+    _dq_issues, _dq_level = data_quality_report(df)
+except Exception:
+    _dq_issues, _dq_level = [], "ok"
+if _dq_level == "critical":
+    st.error("🛑 **DỮ LIỆU KHÔNG ĐÁNG TIN — KHÔNG NÊN GIAO DỊCH THEO MÃ NÀY**\n\n"
+             + "\n\n".join(f"• {i['msg']}" for i in _dq_issues if i["level"]=="critical"))
+elif _dq_level == "warning":
+    with st.expander(f"⚠️ Có {len(_dq_issues)} lưu ý về chất lượng dữ liệu — bấm để xem"):
+        for i in _dq_issues: st.markdown(f"- {i['msg']}")
+
 chg=float(lat.Close)-float(prev.Close); pct_chg=chg/float(prev.Close)*100 if float(prev.Close) else 0
 chg_str=f"{'▲' if chg>=0 else '▼'} {abs(chg):,.0f} đ ({abs(pct_chg):.2f}%)"
 st.caption(f"📡 Nguồn: {price_src} · {len(df)} phiên · {'🟢' if chg>=0 else '🔴'} {chg_str} · {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
@@ -2245,7 +2652,7 @@ with tab3:
 with tab4:
     st.markdown("### 🏭 So sánh cùng ngành")
     cur_sec=next((s for s,ps in SECTOR_PEERS.items() if symbol in ps),None)
-    if cur_sec: st.info(f"**Ngành:** {cur_sec} | P/E median: {SECTOR_PE.get(cur_sec,'—')}x")
+    if cur_sec: st.info(f"**Ngành:** {cur_sec} — P/E median sẽ được tính từ dữ liệu thực sau khi tải so sánh")
     else: cur_sec=st.selectbox("Chọn ngành",list(SECTOR_PEERS.keys()))
     peers=[p for p in SECTOR_PEERS[cur_sec] if p!=symbol]
     sel_peers=st.multiselect("Chọn mã so sánh",peers,default=peers[:4])
@@ -2277,7 +2684,18 @@ with tab4:
         prog.empty()
         st.session_state.cmp_data=cmp_data
     cmp_data=st.session_state.cmp_data
+    # A2: tính median P/E ngành TỪ DỮ LIỆU THỰC thay vì hằng số viết cứng
+    _pe_map={}
+    for _r in (cmp_data or []):
+        try:
+            _v=float(str(_r.get("P/E","")).replace("x",""))
+            if _v>0: _pe_map[_r["Mã"]]=_v
+        except Exception: pass
+    _dyn_pe,_dyn_n,_dyn_src=dynamic_sector_pe(_pe_map,cur_sec)
     if cmp_data:
+        st.caption(f"📐 **P/E median ngành {cur_sec}: "
+                   f"{_dyn_pe:.1f}x**" if _dyn_pe else "📐 Chưa xác định được P/E median ngành")
+        st.caption(f"Nguồn: {_dyn_src}" + (f" ({_dyn_n} mã)" if _dyn_n else ""))
         n_ok=sum(1 for r in cmp_data if r["Giá"]!="—")
         st.caption(f"Tải xong: {n_ok}/{len(cmp_data)} mã có dữ liệu")
         st.dataframe(pd.DataFrame(cmp_data),use_container_width=True,hide_index=True)
@@ -2289,9 +2707,10 @@ with tab4:
             fpE=go.Figure(go.Bar(x=list(mcs2),y=list(pes2),
                 marker_color=["#4a9ef8" if m==symbol else "#163350" for m in mcs2],
                 text=[f"{v:.1f}x" for v in pes2],textposition="outside"))
-            if SECTOR_PE.get(cur_sec):
-                fpE.add_hline(y=SECTOR_PE[cur_sec],line=dict(color="#f5a623",dash="dot",width=1.5),
-                    annotation_text=f" Median ngành {SECTOR_PE[cur_sec]}x",annotation_font=dict(color="#f5a623",size=10))
+            if _dyn_pe:
+                _lbl=("Median thực tế" if "động" in _dyn_src else "Median tham chiếu")
+                fpE.add_hline(y=_dyn_pe,line=dict(color="#f5a623",dash="dot",width=1.5),
+                    annotation_text=f" {_lbl} {_dyn_pe:.1f}x",annotation_font=dict(color="#f5a623",size=10))
             fpE.update_layout(height=260,title="So sánh P/E toàn ngành",template="plotly_dark",**CHART_STYLE)
             fpE.layout.title.font.color="#8baed4"
             st.plotly_chart(fpE,use_container_width=True)
@@ -2316,7 +2735,7 @@ with tab4:
                 if pe_list:
                     cheapest = min(pe_list, key=lambda x:x[1])
                     most_exp = max(pe_list, key=lambda x:x[1])
-                    med_pe = SECTOR_PE.get(cur_sec)
+                    med_pe = _dyn_pe
                     sym_pe = next((parse_num(r["P/E"]) for r in valid_data if r["Mã"]==symbol), None)
                     vs_txt = ""
                     if sym_pe and med_pe:
@@ -2390,10 +2809,17 @@ with tab5:
         help="Chỉ giữ mã có xu hướng đủ mạnh để đi theo")
     f_breakout=fc4.checkbox("Chỉ mã đang breakout",value=False,key="f_bo",
         help="Giá phá đỉnh kênh Donchian 20 phiên")
-    fc5,fc6=st.columns(2)
+    fc5,fc6,fc7=st.columns(3)
     f_liq=fc5.number_input("Thanh khoản tối thiểu (tỷ đ/phiên)",value=5.0,step=1.0,
         min_value=0.0,key="f_liq",help="Loại mã quá mỏng, khó vào/ra lệnh với vốn thực")
     f_rr=fc6.number_input("R:R tối thiểu",value=1.5,step=0.5,min_value=0.0,key="f_rr")
+    f_rankmode=fc7.selectbox("Cách xếp hạng",
+        ["Điểm tuyệt đối","Xếp hạng % toàn thị trường","Trung hoà ngành (khuyến nghị)"],
+        index=2,key="f_rankmode",
+        help="Điểm tuyệt đối trôi theo chế độ thị trường và khiến cả một ngành cùng lọt bộ lọc. "
+             "Trung hoà ngành so mã với chính các mã cùng ngành → tránh dồn 1 ngành.")
+    f_minpct=st.slider("Chỉ giữ mã trong nhóm dẫn đầu (percentile ≥)",50,95,70,5,key="f_minpct",
+        help="Chỉ áp dụng khi chọn xếp hạng %. 70 = chỉ giữ 30% mã mạnh nhất.")
 
     if "qscan_results" not in st.session_state: st.session_state.qscan_results=[]
     if "qscan_key" not in st.session_state: st.session_state.qscan_key=""
@@ -2419,6 +2845,7 @@ with tab5:
             if r: results.append(r)
             else: failed.append(s2)
         prog.empty()
+        results=add_cross_sectional_ranks(results)   # A1: xếp hạng % + trung hoà ngành
         st.session_state.qscan_results=results
         st.session_state.qscan_failed=failed
         st.session_state.qscan_key=f"{scan_scope}|{scan_days}"
@@ -2429,14 +2856,31 @@ with tab5:
         st.caption(f"Đã chấm điểm {len(results)} mã"+(f" · Không lấy được dữ liệu: {', '.join(failed)}" if failed else ""))
 
         # ── Áp bộ lọc ──
-        passed=[r for r in results
-                if r["quant_score"]>=f_min_score
-                and (not f_trend or r["above_ema200"])
+        _base=[r for r in results
+                if (not f_trend or r["above_ema200"])
                 and (not f_adx or r["adx"]>25)
                 and (not f_breakout or r["breakout"])
                 and r["liquidity_bn"]>=f_liq
                 and r["rr"]>=f_rr]
-        passed.sort(key=lambda x:-x["quant_score"])
+        if f_rankmode.startswith("Điểm tuyệt đối"):
+            passed=[r for r in _base if r["quant_score"]>=f_min_score]
+            passed.sort(key=lambda x:-x["quant_score"])
+            _rank_note="Xếp theo điểm quant tuyệt đối"
+        elif f_rankmode.startswith("Xếp hạng %"):
+            passed=[r for r in _base if (r.get("pct_rank") or 0)>=f_minpct]
+            passed.sort(key=lambda x:-(x.get("pct_rank") or 0))
+            _rank_note=f"Xếp theo percentile toàn thị trường (giữ nhóm ≥{f_minpct})"
+        else:
+            passed=[r for r in _base
+                    if (r.get("sector_rank") is not None and not pd.isna(r.get("sector_rank"))
+                        and r["sector_rank"]>=f_minpct)
+                    or (r.get("sector_rank") is None or pd.isna(r.get("sector_rank")))
+                       and r["quant_score"]>=f_min_score]
+            passed.sort(key=lambda x:-(x.get("neutral_score") if x.get("neutral_score") is not None
+                                       and not pd.isna(x.get("neutral_score")) else -99))
+            _rank_note=(f"Trung hoà ngành — so mã với chính ngành của nó (giữ nhóm ≥{f_minpct} trong ngành). "
+                        "Ngành có dưới 3 mã sẽ dùng điểm tuyệt đối.")
+        st.caption(f"📐 {_rank_note}")
 
         st.markdown(f"#### ✅ {len(passed)}/{len(results)} mã qua bộ lọc hệ thống")
         if not passed:
@@ -2448,7 +2892,11 @@ with tab5:
             bo="🔥 Breakout" if r["breakout"] else ""
             rs_txt=(f"RS {'↑' if (r['rs_slope'] or 0)>0 else '↓'}{abs(r['rs_slope']):.1f}"
                     if r["rs_slope"] is not None else "")
+            _pr=r.get("pct_rank"); _sr=r.get("sector_rank"); _sec=r.get("sector","")
+            _pct_txt=(f"Top {100-_pr:.0f}% TT" if _pr is not None and not pd.isna(_pr) else "")
+            _sec_txt=(f"Top {100-_sr:.0f}% ngành {_sec}" if _sr is not None and not pd.isna(_sr) else _sec)
             tags=" · ".join(t for t in [bo,
+                _pct_txt, _sec_txt,
                 f"ADX {r['adx']:.0f}",
                 f"{'trên' if r['above_ema200'] else 'dưới'} EMA200",
                 rs_txt, f"TK {r['liquidity_bn']:.0f} tỷ"] if t)
@@ -2491,6 +2939,27 @@ with tab5:
                     mime="text/csv",key="dl_scan")
 
         # ── Bức tranh toàn thị trường (breadth) ──
+        # ── A1: Bảng sức mạnh ngành — tránh dồn vốn một ngành ──
+        _sst=sector_strength_table(results)
+        if len(_sst)>0:
+            st.markdown("#### 🏭 Sức mạnh theo ngành")
+            st.caption("Nếu top mã đều rơi vào 1–2 ngành, đó không phải đa dạng hoá mà là "
+                       "một khoản đặt cược nhân lên. Dùng chế độ **Trung hoà ngành** để tránh.")
+            _sd=pd.DataFrame({"Ngành":_sst["sector"],"Số mã":_sst["so_ma"],
+                "Điểm trung vị":_sst["diem_trung_vi"].apply(lambda v:f"{v:+.1f}"),
+                "Điểm TB":_sst["diem_tb"].apply(lambda v:f"{v:+.1f}"),
+                "% trên EMA200":_sst["pct_tren_ema200"].apply(lambda v:f"{v:.0f}%")})
+            st.dataframe(_sd,use_container_width=True,hide_index=True)
+            if passed:
+                _cnt={}
+                for r in passed[:10]:
+                    _sx=r.get("sector","Khác"); _cnt[_sx]=_cnt.get(_sx,0)+1
+                _top=max(_cnt.items(),key=lambda x:x[1])
+                if _top[1]>=len(passed[:10])*0.5 and len(passed)>=4:
+                    st.warning(f"⚠️ **{_top[1]}/{min(10,len(passed))} mã top đều thuộc ngành {_top[0]}** — "
+                               "mua nhiều mã trong nhóm này không làm giảm rủi ro. "
+                               "Chọn tối đa 2 mã mỗi ngành.")
+
         st.markdown("#### 🌡️ Nhiệt độ thị trường theo hệ thống")
         n=len(results)
         n_buy=sum(1 for r in results if r["quant_score"]>=2.5)
@@ -2502,6 +2971,7 @@ with tab5:
         avg_score=sum(r["quant_score"] for r in results)/n if n else 0
         breadth=n_above/n*100 if n else 0
 
+        _bd=market_breadth(results)   # A7: breadth đầy đủ thay cho tính thủ công
         b1,b2,b3,b4=st.columns(4)
         b1.markdown(metric_html("Điểm quant TB",f"{avg_score:+.1f}",
             "#00d97e" if avg_score>1 else "#f5a623" if avg_score>-1 else "#ff3d5a"),unsafe_allow_html=True)
@@ -2511,14 +2981,34 @@ with tab5:
         b4.markdown(metric_html("Mã đạt ngưỡng MUA",f"{n_buy}/{n}",
             "#00d97e" if n_buy>n*0.3 else "#f5a623"),unsafe_allow_html=True)
 
-        if breadth>60 and avg_score>1:
-            regime="🟢 **Thị trường THUẬN LỢI** cho hệ thống trend-following — có thể nâng dần tỷ trọng theo tín hiệu."
-        elif breadth<40 or avg_score<-1:
-            regime=("🔴 **Thị trường BẤT LỢI** — phần lớn mã dưới EMA200. Hệ thống trend-following "
-                    "sẽ thua lỗ liên tục trong giai đoạn này; ưu tiên giữ tiền mặt và giảm tần suất giao dịch.")
+        # A7: chỉ số breadth bổ sung — A/D, đỉnh/đáy 52 tuần, thanh khoản
+        if _bd:
+            b5,b6,b7,b8=st.columns(4)
+            _ad=_bd.get("ad_ratio")
+            b5.markdown(metric_html("Tăng / Giảm (A/D)",
+                f"{_bd.get('advancers','—')} / {_bd.get('decliners','—')}",
+                "#00d97e" if _ad and _ad>1 else "#ff3d5a"),unsafe_allow_html=True)
+            b6.markdown(metric_html("Mã sát đỉnh 52 tuần",f"{_bd.get('new_high_52w','—')}/{n}",
+                "#00d97e"),unsafe_allow_html=True)
+            b7.markdown(metric_html("Mã sát đáy 52 tuần",f"{_bd.get('near_low_52w','—')}/{n}",
+                "#ff3d5a"),unsafe_allow_html=True)
+            _tl=_bd.get("total_liquidity_bn")
+            b8.markdown(metric_html("Thanh khoản nhóm quét",
+                f"{_tl:,.0f} tỷ/phiên" if _tl else "—"),unsafe_allow_html=True)
+            _nh=_bd.get("new_high_52w") or 0; _nl=_bd.get("near_low_52w") or 0
+            if _nl>_nh*2 and _nl>=3:
+                st.caption(f"⚠️ Số mã sát ĐÁY 52 tuần ({_nl}) nhiều gấp bội số mã sát đỉnh ({_nh}) "
+                           "— nội tại thị trường yếu hơn những gì chỉ số chung thể hiện.")
+
+        if _bd and _bd.get("regime"):
+            _rc=_bd["regime_color"]
+            _icon={"#00d97e":"🟢","#ff3d5a":"🔴"}.get(_rc,"🟡")
+            _extra={"#00d97e":"có thể nâng dần tỷ trọng theo tín hiệu.",
+                    "#ff3d5a":"hệ thống trend-following sẽ thua lỗ liên tục; ưu tiên tiền mặt hoặc chuyển sang Tab 9.",
+                    "#f5a623":"chỉ chọn lọc mã điểm cao nhất, giảm tỷ trọng mỗi lệnh."}.get(_rc,"")
+            st.markdown(f"{_icon} **Thị trường {_bd['regime']}** — {_extra}")
         else:
-            regime="🟡 **Thị trường PHÂN HOÁ** — chỉ chọn lọc mã điểm cao nhất, giảm tỷ trọng mỗi lệnh."
-        st.markdown(regime)
+            st.markdown("🟡 **Thị trường PHÂN HOÁ** — chỉ chọn lọc mã điểm cao nhất, giảm tỷ trọng mỗi lệnh.")
 
         fig_dist=go.Figure(go.Bar(
             x=["Mua (≥2.5)","Theo dõi (1–2.5)","Trung tính","Tiêu cực (<−1)"],
@@ -2939,7 +3429,148 @@ with tab8:
 
     # ══ KIỂM ĐỊNH ĐA MÃ — PHÁT HIỆN OVERFITTING ══
     st.markdown("---")
-    st.markdown("#### 6️⃣ Kiểm định ĐA MÃ — hệ thống có lợi thế thật hay chỉ may ở 1 mã?")
+    # ══ KIỂM ĐỊNH NÂNG CAO — CHỐNG OVERFIT ══
+    st.markdown("---")
+    st.markdown("#### 6️⃣ Kiểm định NÂNG CAO — hệ thống có edge thật hay chỉ khớp quá khứ?")
+    st.caption("Backtest thông thường chọn tham số VÀ kiểm định trên cùng một dữ liệu nên luôn đẹp giả tạo. "
+               "Ba phép thử dưới đây được thiết kế để phá vỡ ảo tưởng đó.")
+
+    adv_tab1,adv_tab2,adv_tab3=st.tabs(["🔀 Walk-forward","🗺️ Nhạy tham số","🎲 Monte Carlo"])
+
+    # ── A3: Walk-forward ──
+    with adv_tab1:
+        st.markdown("**Chọn tham số ở nửa ĐẦU lịch sử → kiểm định ở nửa SAU (dữ liệu chưa từng thấy).**")
+        st.caption("Chênh lệch giữa train và test chính là mức độ overfit. "
+                   "Suy giảm lớn nghĩa là tham số chỉ khớp quá khứ, không phải quy luật.")
+        wf_ratio=st.slider("Tỷ lệ dữ liệu dùng để chọn tham số (train)",0.4,0.8,0.6,0.05,key="wf_ratio")
+        if st.button("🔀 Chạy Walk-forward",key="btn_wf",use_container_width=True):
+            with st.spinner("Đang chọn tham số trên train rồi kiểm định trên test..."):
+                st.session_state.wf_res=(walk_forward_backtest(df,wf_ratio,exit_score=bt_exit,
+                    apply_costs=bt_costs),symbol)
+        _w=st.session_state.get("wf_res")
+        if _w and _w[1]==symbol:
+            wf,werr=_w[0]
+            if werr: st.info(f"ℹ️ {werr}")
+            elif wf:
+                w1,w2,w3,w4=st.columns(4)
+                w1.markdown(metric_html("Ngưỡng chọn từ train",f"{wf['best_entry']:+.1f}"),unsafe_allow_html=True)
+                w2.markdown(metric_html("ExpR trên TRAIN",f"{wf['train_er']:+.2f}R",
+                    "#8baed4"),unsafe_allow_html=True)
+                _te=wf["test_er"]
+                w3.markdown(metric_html("ExpR trên TEST",f"{_te:+.2f}R" if _te is not None else "—",
+                    "#00d97e" if _te and _te>0.15 else "#ff3d5a"),unsafe_allow_html=True)
+                _dg=wf["degradation"]
+                w4.markdown(metric_html("Mức suy giảm",f"{_dg:+.2f}R" if _dg is not None else "—",
+                    "#00d97e" if _dg and _dg>-0.15 else "#ff3d5a"),unsafe_allow_html=True)
+                st.caption(f"Cắt tại ngày {pd.to_datetime(wf['split_date']).strftime('%d/%m/%Y')} · "
+                           f"train {wf['train_n']} lệnh · test {wf['test_n']} lệnh")
+                if _te is not None and _te>0.15 and (_dg is None or _dg>-0.3):
+                    st.success("✅ **Vượt qua phép thử.** Tham số chọn từ quá khứ vẫn hiệu quả trên dữ liệu "
+                               "chưa từng thấy — dấu hiệu của quy luật thật, không phải trùng hợp.")
+                elif _te is not None and _te<=0:
+                    st.error(f"❌ **KHÔNG vượt qua.** Train {wf['train_er']:+.2f}R nhưng test {_te:+.2f}R "
+                             f"(suy giảm {_dg:+.2f}R). Tham số chỉ khớp quá khứ. "
+                             "Đây là lý do không nên tin backtest thông thường — nó luôn cho kết quả như phần train.")
+                else:
+                    st.warning(f"⚠️ **Kết quả mong manh.** Test {_te:+.2f}R — dương nhưng mỏng. "
+                               "Giữ tỷ trọng nhỏ nếu vẫn muốn giao dịch.")
+                with st.expander("📋 Bảng chọn tham số trên giai đoạn train"):
+                    _tt=wf["train_table"].copy()
+                    _tt.columns=["Ngưỡng vào","ExpR","Số lệnh","Lãi"]
+                    _tt["ExpR"]=_tt["ExpR"].apply(lambda v:f"{v:+.2f}R")
+                    _tt["Lãi"]=_tt["Lãi"].apply(lambda v:f"{v*100:+.1f}%")
+                    st.dataframe(_tt,use_container_width=True,hide_index=True)
+
+    # ── A4: Nhạy tham số ──
+    with adv_tab2:
+        st.markdown("**Quét toàn bộ lưới ngưỡng vào × ngưỡng thoát.**")
+        st.caption("Edge THẬT thì cả vùng lân cận đều dương. Edge GIẢ chỉ đẹp ở đúng một ô "
+                   "và xấu ngay xung quanh — dấu hiệu anh đã vô tình chọn tham số khớp nhiễu.")
+        if st.button("🗺️ Chạy bản đồ nhạy tham số",key="btn_sens",use_container_width=True):
+            with st.spinner("Đang quét lưới tham số (30 tổ hợp)..."):
+                st.session_state.sens_res=(parameter_sensitivity(df,apply_costs=bt_costs),symbol)
+        _s=st.session_state.get("sens_res")
+        if _s and _s[1]==symbol:
+            sm,serr=_s[0]
+            if serr: st.info(f"ℹ️ {serr}")
+            elif sm:
+                s1,s2=st.columns(2)
+                _stb=sm["stability"]
+                s1.markdown(metric_html("Độ ổn định",f"{_stb*100:.0f}% ô có ExpR dương",
+                    "#00d97e" if _stb>0.7 else "#f5a623" if _stb>0.5 else "#ff3d5a"),unsafe_allow_html=True)
+                s2.markdown(metric_html("ExpR trung vị toàn lưới",f"{sm['median_er']:+.2f}R",
+                    "#00d97e" if sm["median_er"]>0.1 else "#ff3d5a"),unsafe_allow_html=True)
+                g=sm["grid"]
+                piv=g.pivot(index="exit",columns="entry",values="er")
+                fig_h=go.Figure(go.Heatmap(z=piv.values,x=[f"{c:+.1f}" for c in piv.columns],
+                    y=[f"{i:+.1f}" for i in piv.index],
+                    colorscale=[[0,"#cc1133"],[0.5,"#0c1d2e"],[1,"#00d97e"]],zmid=0,
+                    text=[[f"{v:+.2f}" if pd.notna(v) else "" for v in row] for row in piv.values],
+                    texttemplate="%{text}",textfont=dict(size=10),
+                    colorbar=dict(title="ExpR")))
+                fig_h.update_layout(height=320,title="ExpR theo ngưỡng vào (trục X) × ngưỡng thoát (trục Y)",
+                    template="plotly_dark",**CHART_STYLE)
+                fig_h.layout.title.font.color="#8baed4";fig_h.layout.title.font.size=12
+                st.plotly_chart(fig_h,use_container_width=True)
+                if _stb>0.7:
+                    st.success("✅ **Edge ổn định** — phần lớn tổ hợp tham số đều cho kỳ vọng dương. "
+                               "Kết quả không phụ thuộc vào việc chọn đúng một con số may mắn.")
+                elif _stb<0.5:
+                    st.error("❌ **Edge không ổn định** — quá nửa tổ hợp cho kỳ vọng âm. "
+                             "Nếu có ô nào đẹp, nhiều khả năng đó là trùng hợp. "
+                             "**Đừng chọn ô đẹp nhất rồi giao dịch theo nó.**")
+                else:
+                    st.warning("⚠️ Ổn định trung bình — chọn tham số ở vùng GIỮA của mảng xanh, "
+                               "không chọn ô cực trị.")
+
+    # ── A5: Monte Carlo ──
+    with adv_tab3:
+        st.markdown("**Bốc lại mẫu chuỗi lệnh hàng nghìn lần.**")
+        st.caption("Đường vốn anh thấy chỉ là MỘT kết quả trong vô số khả năng. "
+                   "Monte Carlo cho biết cú drawdown tệ nhất anh CÓ THỂ gặp, không chỉ cú đã tình cờ xảy ra.")
+        if st.button("🎲 Chạy Monte Carlo",key="btn_mc",use_container_width=True):
+            _b=st.session_state.get("bt_result")
+            if not _b or _b[2]!=symbol or _b[0] is None:
+                st.warning("Chạy **Kiểm định lịch sử** ở mục 5 trước để có chuỗi lệnh.")
+            else:
+                with st.spinner("Đang mô phỏng 2000 kịch bản..."):
+                    st.session_state.mc_res=(monte_carlo_trades(_b[0]["trades"]["pnl_pct"]),symbol)
+        _m=st.session_state.get("mc_res")
+        if _m and _m[1]==symbol:
+            mc,merr=_m[0]
+            if merr: st.info(f"ℹ️ {merr}")
+            elif mc:
+                c1,c2,c3,c4=st.columns(4)
+                c1.markdown(metric_html("Lợi nhuận trung vị",f"{mc['ret_median']*100:+.1f}%",
+                    "#00d97e" if mc["ret_median"]>0 else "#ff3d5a"),unsafe_allow_html=True)
+                c2.markdown(metric_html("Xác suất THUA LỖ",f"{mc['prob_loss']*100:.0f}%",
+                    "#ff3d5a" if mc["prob_loss"]>0.4 else "#f5a623" if mc["prob_loss"]>0.25 else "#00d97e"),unsafe_allow_html=True)
+                c3.markdown(metric_html("Drawdown trung vị",f"{mc['dd_median']*100:.1f}%","#ff3d5a"),unsafe_allow_html=True)
+                c4.markdown(metric_html("Drawdown tệ nhất",f"{mc['dd_worst']*100:.1f}%","#cc1133"),unsafe_allow_html=True)
+                st.markdown(f"""<div style='background:#0c1d2e;border:1px solid #163350;border-radius:9px;
+                  padding:12px 16px;font-size:13px;color:#cce0ff;line-height:1.8;'>
+                  <b>Khoảng kết quả 90%:</b> từ <b style='color:#ff3d5a;'>{mc['ret_p05']*100:+.1f}%</b>
+                  đến <b style='color:#00d97e;'>{mc['ret_p95']*100:+.1f}%</b><br>
+                  <b>Xác suất drawdown vượt 20%:</b> {mc['prob_dd_20']*100:.0f}% &nbsp;·&nbsp;
+                  <b>vượt 30%:</b> {mc['prob_dd_30']*100:.0f}%
+                </div>""",unsafe_allow_html=True)
+                fig_mc=make_subplots(rows=1,cols=2,subplot_titles=("Phân phối lợi nhuận","Phân phối Drawdown"))
+                fig_mc.add_trace(go.Histogram(x=mc["finals"]*100,marker_color="#4a9ef8",
+                    nbinsx=50,showlegend=False),row=1,col=1)
+                fig_mc.add_trace(go.Histogram(x=mc["dds"]*100,marker_color="#ff3d5a",
+                    nbinsx=50,showlegend=False),row=1,col=2)
+                fig_mc.update_layout(height=280,template="plotly_dark",**CHART_STYLE)
+                for ann in fig_mc.layout.annotations: ann.font.color="#8baed4";ann.font.size=11
+                st.plotly_chart(fig_mc,use_container_width=True)
+                if mc["prob_loss"]>0.4:
+                    st.error(f"❌ **{mc['prob_loss']*100:.0f}% kịch bản dẫn tới thua lỗ.** "
+                             "Kết quả backtest tốt mà anh vừa thấy phần lớn là do may mắn về thứ tự lệnh.")
+                elif mc["prob_dd_30"]>0.15:
+                    st.warning(f"⚠️ Có {mc['prob_dd_30']*100:.0f}% khả năng gặp drawdown trên 30%. "
+                               "Cân nhắc anh có chịu được mức sụt đó mà không bỏ hệ thống giữa chừng không.")
+
+    st.markdown("---")
+    st.markdown("#### 7️⃣ Kiểm định ĐA MÃ — hệ thống có lợi thế thật hay chỉ may ở 1 mã?")
     st.caption("Đây là phép thử quan trọng nhất. Một hệ thống lãi ở 1–2 mã là ngẫu nhiên; "
                "chỉ khi có kỳ vọng dương trên **đa số** mã thì mới là lợi thế thống kê thật sự đáng đặt tiền.")
     ms1,ms2=st.columns([2,1])
@@ -3014,7 +3645,107 @@ with tab8:
     st.markdown("---")
     # ══ QUẢN TRỊ RỦI RO TOÀN TÀI KHOẢN (tài khoản tiền tươi, không margin) ══
     st.markdown("---")
-    st.markdown("#### 7️⃣ Quản trị rủi ro toàn tài khoản — Portfolio Heat")
+    # ══ A6: BACKTEST CẤP DANH MỤC ══
+    st.markdown("---")
+    st.markdown("#### 8️⃣ Backtest CẤP DANH MỤC — mô phỏng vốn hữu hạn")
+    st.caption("Backtest từng mã riêng lẻ ngầm giả định vốn vô hạn và bỏ qua việc phải CHỌN "
+               "giữa nhiều tín hiệu xuất hiện cùng lúc. Mục này mô phỏng đúng cách anh giao dịch thật: "
+               "vốn có hạn, tối đa N vị thế, trần rủi ro toàn tài khoản, giới hạn số mã cùng ngành.")
+    pb1,pb2,pb3=st.columns(3)
+    pb_scope=pb1.selectbox("Nhóm mã",["Nhóm đại diện (12 mã đa ngành)"]+list(SECTOR_PEERS.keys()),key="pb_scope")
+    pb_cap=pb2.number_input("Vốn ban đầu (triệu đ)",value=100.0,step=50.0,key="pb_cap")*1e6
+    pb_days=pb3.selectbox("Lịch sử",[500,730],index=0,key="pb_days")
+    pb4,pb5,pb6,pb7=st.columns(4)
+    pb_risk=pb4.number_input("Rủi ro/lệnh (%)",value=1.0,step=0.25,min_value=0.1,max_value=3.0,key="pb_risk")
+    pb_maxpos=pb5.number_input("Vị thế tối đa",value=5,step=1,min_value=1,max_value=15,key="pb_maxpos")
+    pb_heat=pb6.number_input("Trần rủi ro DM (%)",value=6.0,step=1.0,min_value=1.0,max_value=25.0,key="pb_heat")
+    pb_seccap=pb7.number_input("Tối đa mã/ngành",value=2,step=1,min_value=1,max_value=6,key="pb_seccap")
+
+    if st.button("🏦 Chạy backtest danh mục",key="btn_pbt",use_container_width=True):
+        _syms=(["VCB","TCB","VPB","HPG","FPT","MWG","VIC","SSI","GAS","VNM","REE","DHG"]
+               if pb_scope.startswith("Nhóm đại diện") else SECTOR_PEERS[pb_scope])
+        _prog=st.progress(0.0); _data={}
+        for _i,_s in enumerate(_syms):
+            _prog.progress((_i+1)/len(_syms),f"Tải {_s}...")
+            try:
+                _d,_=fetch_price(_s,pb_days,"1D")
+                if _d is not None and len(_d)>=280: _data[_s]=add_indicators(_d.copy())
+            except Exception: pass
+        _prog.empty()
+        if len(_data)<3:
+            st.error(f"Chỉ tải được {len(_data)} mã — cần tối thiểu 3 mã để mô phỏng danh mục.")
+        else:
+            with st.spinner(f"Đang mô phỏng danh mục trên {len(_data)} mã..."):
+                st.session_state.pbt_res=portfolio_backtest(_data,bt_entry,bt_exit,pb_cap,
+                    pb_risk,int(pb_maxpos),20.0,pb_heat,warmup=210,apply_costs=bt_costs,
+                    sector_cap=int(pb_seccap))
+
+    _p=st.session_state.get("pbt_res")
+    if _p:
+        pbr,pberr=_p
+        if pberr: st.info(f"ℹ️ {pberr}")
+        elif pbr:
+            n1,n2,n3,n4=st.columns(4)
+            n1.markdown(metric_html("Vốn cuối kỳ",f"{pbr['final_equity']/1e6:,.1f} tr",
+                "#00d97e" if pbr["total_return"]>0 else "#ff3d5a"),unsafe_allow_html=True)
+            n2.markdown(metric_html("Lợi nhuận",f"{pbr['total_return']*100:+.1f}%",
+                "#00d97e" if pbr["total_return"]>0 else "#ff3d5a"),unsafe_allow_html=True)
+            n3.markdown(metric_html("Mua&giữ đều tay",f"{pbr['buyhold_equal']*100:+.1f}%","#8baed4"),unsafe_allow_html=True)
+            n4.markdown(metric_html("Max Drawdown",f"{pbr['max_dd']*100:.1f}%","#ff3d5a"),unsafe_allow_html=True)
+            n5,n6,n7,n8=st.columns(4)
+            n5.markdown(metric_html("Sharpe",f"{pbr['sharpe']:.2f}" if pbr['sharpe'] else "—",
+                "#00d97e" if pbr['sharpe'] and pbr['sharpe']>0.5 else "#f5a623"),unsafe_allow_html=True)
+            n6.markdown(metric_html("Số lệnh / Win rate",f"{pbr['n_trades']} / {pbr['win_rate']*100:.0f}%"),unsafe_allow_html=True)
+            _er=pbr["expectancy_r"]
+            n7.markdown(metric_html("Expectancy",f"{_er:+.2f}R" if _er is not None else "—",
+                "#00d97e" if _er and _er>0.1 else "#ff3d5a"),unsafe_allow_html=True)
+            n8.markdown(metric_html("Vị thế TB / Giải ngân",
+                f"{pbr['avg_positions']:.1f} / {pbr['avg_invested']:.0f}%"),unsafe_allow_html=True)
+
+            _rej=pbr["rejected_slots"]+pbr["rejected_heat"]+pbr["rejected_sector"]
+            if _rej>0:
+                st.info(f"ℹ️ **{_rej} tín hiệu bị từ chối do ràng buộc vốn thực tế** — "
+                        f"hết chỗ: {pbr['rejected_slots']} · vượt trần rủi ro: {pbr['rejected_heat']} · "
+                        f"quá số mã cùng ngành: {pbr['rejected_sector']}. "
+                        "Backtest từng mã riêng lẻ bỏ qua toàn bộ phần này, nên luôn cho kết quả đẹp hơn thực tế.")
+            if pbr["total_return"]>pbr["buyhold_equal"]:
+                st.success(f"✅ Danh mục ({pbr['total_return']*100:+.1f}%) vượt mua&giữ đều tay "
+                           f"({pbr['buyhold_equal']*100:+.1f}%) sau chi phí và ràng buộc vốn.")
+            else:
+                st.warning(f"⚠️ Danh mục ({pbr['total_return']*100:+.1f}%) thua mua&giữ đều tay "
+                           f"({pbr['buyhold_equal']*100:+.1f}%). Đổi lại drawdown {pbr['max_dd']*100:.1f}% "
+                           f"và chỉ giải ngân trung bình {pbr['avg_invested']:.0f}% vốn.")
+
+            _eq=pbr["equity"]
+            fig_p=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=0.06,
+                row_heights=[0.68,0.32],subplot_titles=("Giá trị danh mục","Số vị thế & tỷ lệ giải ngân"))
+            fig_p.add_trace(go.Scatter(x=_eq["Date"],y=_eq["equity"]/1e6,name="Giá trị DM (tr đ)",
+                line=dict(color="#00d97e",width=2)),row=1,col=1)
+            fig_p.add_hline(y=pb_cap/1e6,line=dict(color="rgba(255,255,255,.25)",dash="dot",width=1),row=1,col=1)
+            fig_p.add_trace(go.Scatter(x=_eq["Date"],y=_eq["invested_pct"],name="% giải ngân",
+                line=dict(color="#4a9ef8",width=1.5)),row=2,col=1)
+            fig_p.add_trace(go.Scatter(x=_eq["Date"],y=_eq["n_pos"]*20,name="Số vị thế (×20)",
+                line=dict(color="#f5a623",width=1,dash="dot")),row=2,col=1)
+            fig_p.update_layout(height=420,template="plotly_dark",**CHART_STYLE)
+            for ann in fig_p.layout.annotations: ann.font.color="#8baed4";ann.font.size=11
+            st.plotly_chart(fig_p,use_container_width=True)
+
+            with st.expander("📋 Chi tiết lệnh danh mục"):
+                _td=pbr["trades"].copy()
+                _td["Ngày vào"]=pd.to_datetime(_td["entry_date"]).dt.strftime("%d/%m/%y")
+                _td["Ngày ra"]=pd.to_datetime(_td["exit_date"]).dt.strftime("%d/%m/%y")
+                _td["Lãi/lỗ"]=_td["pnl"].apply(lambda v:f"{v/1e6:+.2f} tr")
+                _td["%"]=_td["pnl_pct"].apply(lambda v:f"{v*100:+.1f}%")
+                _td["R"]=_td["r_multiple"].apply(lambda v:f"{v:+.2f}R" if pd.notna(v) else "—")
+                st.dataframe(_td[["sym","Ngày vào","Ngày ra","bars_held","Lãi/lỗ","%","R","reason"]]
+                    .rename(columns={"sym":"Mã","bars_held":"Phiên","reason":"Lý do thoát"}),
+                    use_container_width=True,hide_index=True)
+            st.caption(f"Mô phỏng trên {pbr['n_symbols']} mã, {pbr['n_bars']} phiên. "
+                       "Đây là con số sát thực tế nhất trong toàn bộ app, vì nó tính cả việc "
+                       "anh phải chọn lệnh nào khi vốn không đủ cho tất cả tín hiệu.")
+
+    st.markdown("---")
+    st.markdown("#### 9️⃣ Quản trị rủi ro toàn tài khoản — Portfolio Heat")
     st.caption("Rủi ro giết tài khoản không nằm ở một lệnh, mà ở việc nhiều lệnh cùng sai một lúc. "
                "Mục này cộng dồn rủi ro của TẤT CẢ vị thế đang mở để anh biết nếu mọi thứ chạm stop cùng lúc "
                "thì tài khoản mất bao nhiêu.")
@@ -3113,7 +3844,7 @@ with tab8:
                        "không phải phần đã lỗ. Vị thế đang lãi và đã kéo stop lên trên giá vào sẽ có rủi ro ~0.")
 
     st.markdown("---")
-    st.markdown("#### 8️⃣ Nhật ký lệnh đã đóng — Win Rate / Expectancy / Kelly")
+    st.markdown("#### 🔟 Nhật ký lệnh đã đóng — Win Rate / Expectancy / Kelly")
     st.caption("Dùng để đánh giá hệ thống giao dịch của Hải Đăng dựa trên các lệnh đã chốt lời/cắt lỗ thực tế.")
     if "trade_log" not in st.session_state:
         st.session_state.trade_log = pd.DataFrame(
