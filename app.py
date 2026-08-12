@@ -1456,33 +1456,61 @@ def scan_capitulation(sym, days=365, min_score=6.0, confirm_window=3):
 # không phải tín hiệu vào lệnh.
 
 _QTR_ALIASES = {
-    'revenue':        ['revenue','net_revenue','sales','net_sales','revenue_net'],
+    # Tên lấy theo dữ liệu THẬT của KBS (item_id dạng 'n_1.revenue' — tiền tố được bóc tự động)
+    'revenue':        ['net_revenue','revenue','sales','net_sales','revenue_from_sales',
+                       'total_operating_income','net_interest_income'],
     'gross_profit':   ['gross_profit','gross_profit_loss'],
-    'net_profit':     ['net_profit','net_profit_after_tax','profit_after_tax',
-                       'net_profit_for_the_year','attributable_to_parent_company'],
-    'ebit':           ['ebit','operating_profit','profit_from_operating_activities'],
-    'interest_exp':   ['interest_expense','interest_expenses','financial_expenses_interest'],
-    'ocf':            ['net_cash_flow_from_operating_activities','net_cash_from_operating',
-                       'cash_flow_from_operating','operating_cash_flow','net_cash_flows_from_operating_activities'],
+    'cogs':           ['cost_of_goods_sold','cost_of_sales'],
+    'net_profit':     ['net_profit_after_tax','profit_after_tax','net_profit',
+                       'profit_after_corporate_income_tax','net_profit_for_the_period',
+                       'attributable_to_parent_company','profit_after_tax_of_parent'],
+    'pretax_profit':  ['profit_before_tax','total_profit_before_tax','net_accounting_profit_loss_before_tax'],
+    'ebit':           ['operating_profit','profit_from_operating_activities','ebit',
+                       'net_operating_profit_loss'],
+    'interest_exp':   ['interest_expense','borrowing_costs','interest_expenses',
+                       'in_which_interest_expense','financial_expenses'],
+    # Dòng tiền — tên KBS dài và khác hẳn quy ước thông thường
+    'ocf':            ['net_cash_inflows_outflows_from_operating_activities',
+                       'net_cash_flows_from_operating_activities',
+                       'net_cash_flow_from_operating_activities',
+                       'cash_flows_from_operating_activities',
+                       'net_cash_from_operating_activities','operating_cash_flow'],
+    'icf':            ['net_cash_inflows_outflows_from_investing_activities',
+                       'net_cash_flows_from_investing_activities'],
+    'fcf_fin':        ['net_cash_inflows_outflows_from_financing_activities',
+                       'net_cash_flows_from_financing_activities'],
+    'capex':          ['purchase_of_fixed_assets','purchases_of_fixed_assets_and_other_long_term_assets',
+                       'acquisition_of_fixed_assets'],
+    'depreciation':   ['depreciation_of_fixed_assets_and_investment_properties',
+                       'depreciation_and_amortisation','depreciation'],
+    'cash_end':       ['cash_and_cash_equivalents_at_end_of_the_period',
+                       'cash_and_cash_equivalents_at_the_end_of_period'],
+    'cash_begin':     ['cash_and_cash_equivalents_at_beginning_of_the_period'],
+    # Cân đối kế toán
     'receivables':    ['short_term_receivables','accounts_receivable','current_receivables',
-                       'short_term_trade_receivables'],
-    'inventory':      ['inventory','inventories','net_inventories'],
+                       'short_term_trade_receivables','trade_receivables',
+                       'short_term_accounts_receivable'],
+    'inventory':      ['inventories','inventory','net_inventories'],
     'cash':           ['cash_and_cash_equivalents','cash','cash_and_equivalents'],
-    'short_debt':     ['short_term_borrowings','short_term_debt','short_term_loans'],
+    'short_debt':     ['short_term_borrowings','short_term_debt','short_term_loans',
+                       'short_term_borrowings_and_finance_lease_liabilities'],
+    'long_debt':      ['long_term_borrowings','long_term_debt',
+                       'long_term_borrowings_and_finance_lease_liabilities'],
     'total_debt':     ['total_liabilities','liabilities'],
-    'equity':         ['owners_equity','total_equity','equity'],
-    'total_assets':   ['total_assets','assets'],
+    'equity':         ['owners_equity','total_equity','equity','total_owners_equity'],
+    'total_assets':   ['total_assets','assets','total_resources'],
     'shares':         ['outstanding_shares','shares_outstanding','common_shares_outstanding',
-                       'number_of_shares'],
-    'eps':            ['eps','earnings_per_share','basic_eps'],
+                       'number_of_shares','ordinary_shares','issued_shares'],
+    'eps':            ['eps','earnings_per_share','basic_eps','basic_earnings_per_share'],
     # Ngân hàng
     'nim':            ['nim','net_interest_margin'],
     'cir':            ['cir','cost_to_income','cost_income_ratio'],
-    'npl':            ['npl','bad_debt_ratio','non_performing_loan'],
-    'provision':      ['provision_expense','credit_loss_provision','loan_loss_provision'],
+    'npl':            ['npl','bad_debt_ratio','non_performing_loan','bad_debt_percentage'],
+    'provision':      ['provision_expense','credit_loss_provision','loan_loss_provision',
+                       'provision_for_credit_losses'],
     # Bất động sản
     'customer_advance':['advances_from_customers','short_term_prepayments_from_customers',
-                        'buyer_prepayments'],
+                        'buyer_prepayments','short_term_unearned_revenue'],
 }
 
 def _qcols(df):
@@ -1499,24 +1527,63 @@ def _qcols(df):
     def _key(c):
         m = re.search(r'(\d{4})\D*([1-4])', str(c))
         return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
-    return sorted(cands, key=_key)
+    cands = sorted(cands, key=_key)
+    # KHỬ KỲ TRÙNG: nguồn thật trả cả '2025-Q4' lẫn '2025-Q4_1' (bản điều chỉnh/soát xét).
+    # Giữ cột có NHIỀU dữ liệu hơn; nếu bằng nhau thì giữ cột không có hậu tố.
+    best = {}
+    for c in cands:
+        k = _key(c)
+        if k == (0, 0): continue
+        try: filled = int(pd.to_numeric(df[c], errors="coerce").notna().sum())
+        except Exception: filled = 0
+        has_suffix = bool(re.search(r'_\d+$', str(c)))
+        cur = best.get(k)
+        if cur is None or (filled, not has_suffix) > (cur[1], not cur[2]):
+            best[k] = (c, filled, has_suffix)
+    return [best[k][0] for k in sorted(best)]
+
+def _norm_item(x):
+    """Chuẩn hoá item_id để so khớp.
+    Nguồn thật (KBS) đặt tên dạng 'n_1.revenue', 'n_23.gross_profit' — có tiền tố số thứ tự.
+    Khớp chính xác chuỗi sẽ luôn thất bại, nên phải bóc tiền tố trước khi so."""
+    t = str(x).strip().lower()
+    t = re.sub(r'^[a-z]*_?\d+[\._]\s*', '', t)   # bỏ 'n_1.', 'n_23_', '1.'
+    return re.sub(r'[^a-z0-9]+', '_', t).strip('_')
 
 def _qget(iid, df, col):
-    """Lấy giá trị 1 chỉ tiêu ở 1 kỳ, chịu được cột trùng tên và item_id trùng."""
+    """Lấy giá trị 1 chỉ tiêu ở 1 kỳ. Khớp theo 3 mức, ưu tiên chặt trước lỏng sau:
+       1) khớp đúng sau khi bóc tiền tố  2) khớp toàn từ  3) khớp chứa."""
     if df is None or df.empty or col is None: return None
-    for alias in _QTR_ALIASES.get(iid, [iid]):
-        # LONG (KBS): item_id + cột kỳ
-        if 'item_id' in df.columns:
-            row = df[df['item_id'].astype(str).str.lower() == alias.lower()]
-            if not row.empty and col in df.columns:
-                cell = row[col]
-                if isinstance(cell, pd.DataFrame): cell = cell.iloc[:, 0]
-                v = pd.to_numeric(cell, errors='coerce').dropna()
-                if len(v): return float(v.iloc[0])
-        # WIDE: alias là tên cột
-        elif alias in df.columns:
-            v = pd.to_numeric(df[alias], errors='coerce').dropna()
-            if len(v): return float(v.iloc[-1])
+    aliases = [_norm_item(a) for a in _QTR_ALIASES.get(iid, [iid])]
+
+    def _pick(cell):
+        if isinstance(cell, pd.DataFrame): cell = cell.iloc[:, 0]
+        v = pd.to_numeric(cell, errors='coerce').dropna()
+        return float(v.iloc[0]) if len(v) else None
+
+    if 'item_id' in df.columns and col in df.columns:
+        norm = df['item_id'].map(_norm_item)
+        for a in aliases:                                  # mức 1: khớp đúng
+            hit = df[norm == a]
+            if not hit.empty:
+                r = _pick(hit[col])
+                if r is not None: return r
+        for a in aliases:                                  # mức 2: khớp toàn từ
+            hit = df[norm.str.fullmatch(rf'.*_{re.escape(a)}|{re.escape(a)}_.*', na=False)]
+            if not hit.empty:
+                r = _pick(hit[col])
+                if r is not None: return r
+        for a in aliases:                                  # mức 3: khớp chứa
+            hit = df[norm.str.contains(re.escape(a), na=False, regex=True)]
+            if not hit.empty:
+                r = _pick(hit[col])
+                if r is not None: return r
+    else:
+        cmap = {_norm_item(c): c for c in df.columns}
+        for a in aliases:
+            if a in cmap:
+                v = pd.to_numeric(df[cmap[a]], errors='coerce').dropna()
+                if len(v): return float(v.iloc[-1])
     return None
 
 def _qseries(iid, df, cols):
@@ -1687,6 +1754,160 @@ def earnings_quality_score(q):
                  has_yoy=(yoy is not None))
     return round(raw/max_used*10, 2), d, facts
 
+
+
+# ── B6: NHẬN XÉT TRỰC TIẾP VỀ HOẠT ĐỘNG DOANH NGHIỆP ─────────────────────────
+def business_verdict(q, sector="Khác", eq_score=None, eq_facts=None):
+    """Đọc BCTC quý và viết ra nhận xét bằng ngôn ngữ thường về việc doanh nghiệp
+    đang làm ăn ra sao. Mỗi nhận xét đều gắn với con số cụ thể để anh tự kiểm chứng,
+    không phải lời khen chê chung chung."""
+    inc, bal, cf = q.get("inc"), q.get("bal"), q.get("cf")
+    cols = _qcols(inc)
+    if len(cols) < 2: return None
+    cur = cols[-1]; yoy = cols[-5] if len(cols) >= 5 else None
+    prev = cols[-2]
+    out = dict(quarter=cur, positives=[], negatives=[], neutrals=[], summary="", headline="", trend={})
+
+    def g(iid, df, c): return _qget(iid, df, c)
+    def pct(a, b): return ((a-b)/abs(b)*100) if (a is not None and b not in (None, 0)) else None
+
+    rev_c, rev_p = g('revenue', inc, cur), g('revenue', inc, prev)
+    rev_y = g('revenue', inc, yoy) if yoy else None
+    np_c, np_p = g('net_profit', inc, cur), g('net_profit', inc, prev)
+    np_y = g('net_profit', inc, yoy) if yoy else None
+    gp_c = g('gross_profit', inc, cur)
+    ocf_c = g('ocf', cf, cur)
+
+    # ── Quy mô & tăng trưởng ──
+    g_rev_y = pct(rev_c, rev_y); g_rev_q = pct(rev_c, rev_p)
+    g_np_y = pct(np_c, np_y); g_np_q = pct(np_c, np_p)
+    out["trend"].update(rev_yoy=g_rev_y, rev_qoq=g_rev_q, np_yoy=g_np_y, np_qoq=g_np_q)
+
+    if g_rev_y is not None:
+        if g_rev_y > 25:
+            out["positives"].append(f"**Doanh thu tăng mạnh {g_rev_y:+.0f}%** so với cùng kỳ năm trước "
+                                    "— quy mô kinh doanh đang mở rộng thực sự.")
+        elif g_rev_y > 5:
+            out["positives"].append(f"Doanh thu tăng {g_rev_y:+.0f}% so với cùng kỳ — tăng trưởng ổn định.")
+        elif g_rev_y > -5:
+            out["neutrals"].append(f"Doanh thu gần như đi ngang ({g_rev_y:+.0f}% so với cùng kỳ) "
+                                   "— doanh nghiệp đang ở giai đoạn bão hoà hoặc chững lại.")
+        elif g_rev_y > -25:
+            out["negatives"].append(f"**Doanh thu giảm {g_rev_y:.0f}%** so với cùng kỳ "
+                                    "— hoạt động kinh doanh đang thu hẹp.")
+        else:
+            out["negatives"].append(f"🔴 **Doanh thu sụt {g_rev_y:.0f}%** so với cùng kỳ "
+                                    "— mức suy giảm nghiêm trọng, cần tìm hiểu nguyên nhân trước khi đầu tư.")
+
+    if np_c is not None:
+        if np_c < 0:
+            out["negatives"].append(f"🔴 **Quý này LỖ {abs(np_c)/1e9:,.1f} tỷ đồng.**")
+        elif g_np_y is not None:
+            if np_y is not None and np_y < 0 < np_c:
+                out["positives"].append("**Đã chuyển từ lỗ sang lãi** so với cùng kỳ năm trước.")
+            elif g_np_y > 30:
+                out["positives"].append(f"**Lợi nhuận tăng vọt {g_np_y:+.0f}%** so với cùng kỳ.")
+            elif g_np_y > 0:
+                out["positives"].append(f"Lợi nhuận tăng {g_np_y:+.0f}% so với cùng kỳ.")
+            elif g_np_y > -30:
+                out["negatives"].append(f"Lợi nhuận giảm {g_np_y:.0f}% so với cùng kỳ.")
+            else:
+                out["negatives"].append(f"🔴 **Lợi nhuận sụt {g_np_y:.0f}%** so với cùng kỳ.")
+
+    # ── Chất lượng tăng trưởng: lợi nhuận tăng nhanh hơn doanh thu là dấu hiệu tốt hay xấu? ──
+    if g_rev_y is not None and g_np_y is not None and rev_c and np_c and np_c > 0:
+        if g_np_y > g_rev_y + 15:
+            out["positives"].append(f"Lợi nhuận tăng nhanh hơn doanh thu ({g_np_y:+.0f}% vs {g_rev_y:+.0f}%) "
+                                    "— biên lợi nhuận đang cải thiện, doanh nghiệp bán được giá tốt hơn "
+                                    "hoặc kiểm soát chi phí hiệu quả hơn.")
+        elif g_rev_y > g_np_y + 15:
+            out["negatives"].append(f"Doanh thu tăng {g_rev_y:+.0f}% nhưng lợi nhuận chỉ {g_np_y:+.0f}% "
+                                    "— **bán nhiều hơn mà lãi không tương xứng**, biên lợi nhuận đang bị bào mòn.")
+
+    # ── Biên lợi nhuận ──
+    if rev_c and gp_c is not None and rev_c > 0:
+        gm = gp_c/rev_c*100; out["trend"]["gross_margin"] = gm
+        gp_y = g('gross_profit', inc, yoy) if yoy else None
+        gm_y = (gp_y/rev_y*100) if (gp_y is not None and rev_y) else None
+        if gm_y is not None:
+            d_gm = gm-gm_y
+            if d_gm > 2:
+                out["positives"].append(f"Biên lợi nhuận gộp mở rộng từ {gm_y:.1f}% lên **{gm:.1f}%**.")
+            elif d_gm < -2:
+                out["negatives"].append(f"Biên lợi nhuận gộp thu hẹp từ {gm_y:.1f}% xuống **{gm:.1f}%** "
+                                        "— chi phí đầu vào tăng hoặc phải giảm giá bán.")
+            else:
+                out["neutrals"].append(f"Biên lợi nhuận gộp ổn định quanh {gm:.1f}%.")
+
+    # ── Dòng tiền: phần quan trọng nhất ──
+    if eq_facts and eq_facts.get("ocf_npat") is not None:
+        r = eq_facts["ocf_npat"]
+        if r < 0:
+            out["negatives"].append(f"🔴 **Dòng tiền từ hoạt động kinh doanh ÂM** trong khi báo lãi "
+                                    f"(tỷ lệ {r:.2f}). Nghĩa là lợi nhuận trên báo cáo chưa thu được tiền thật — "
+                                    "đây là dấu hiệu cảnh báo nghiêm trọng nhất trong toàn bộ báo cáo.")
+        elif r < 0.5:
+            out["negatives"].append(f"Dòng tiền hoạt động chỉ bằng {r:.2f} lần lợi nhuận — "
+                                    "phần lớn lợi nhuận vẫn nằm ở khoản phải thu, chưa thành tiền.")
+        elif r >= 1:
+            out["positives"].append(f"**Dòng tiền hoạt động bằng {r:.2f} lần lợi nhuận** — "
+                                    "lợi nhuận có tiền thật kèm theo, chất lượng lợi nhuận tốt.")
+    elif ocf_c is not None and np_c:
+        out["neutrals"].append(f"Dòng tiền hoạt động quý này: {ocf_c/1e9:,.1f} tỷ đồng.")
+
+    # ── Các khoản mục cần cảnh giác ──
+    if eq_facts:
+        if eq_facts.get("rec_gap") is not None and eq_facts["rec_gap"] > 20:
+            out["negatives"].append(f"Phải thu tăng nhanh hơn doanh thu **{eq_facts['rec_gap']:.0f} điểm %** "
+                                    "— doanh nghiệp đang nới lỏng bán chịu để đẩy doanh số, "
+                                    "rủi ro nợ khó đòi tăng lên.")
+        if eq_facts.get("inv_gap") is not None and eq_facts["inv_gap"] > 30:
+            out["negatives"].append(f"Tồn kho tăng nhanh hơn doanh thu **{eq_facts['inv_gap']:.0f} điểm %** "
+                                    "— hàng đang ứ đọng, có thể phải giảm giá hoặc trích lập dự phòng.")
+        if eq_facts.get("interest_cover") is not None:
+            ic = eq_facts["interest_cover"]
+            if ic < 1.5:
+                out["negatives"].append(f"🔴 **Lợi nhuận chỉ đủ trả lãi vay {ic:.1f} lần** — "
+                                        "áp lực tài chính rất lớn, chỉ cần kinh doanh xấu đi một chút "
+                                        "là không đủ trả lãi.")
+            elif ic > 6:
+                out["positives"].append(f"Khả năng trả lãi vay thoải mái ({ic:.1f} lần lợi nhuận hoạt động).")
+        if eq_facts.get("cash_short_debt") is not None:
+            cd = eq_facts["cash_short_debt"]
+            if cd < 0.3:
+                out["negatives"].append(f"Tiền mặt chỉ bằng **{cd:.1f} lần** nợ vay ngắn hạn — "
+                                        "phụ thuộc vào việc đảo nợ, rủi ro thanh khoản nếu tín dụng siết lại.")
+            elif cd > 1:
+                out["positives"].append(f"Tiền mặt phủ hết nợ vay ngắn hạn ({cd:.1f} lần) — bảng cân đối an toàn.")
+        if eq_facts.get("share_growth") is not None and eq_facts["share_growth"] > 15:
+            out["negatives"].append(f"**Số cổ phiếu lưu hành tăng {eq_facts['share_growth']:.0f}%** trong 1 năm — "
+                                    "phần sở hữu của cổ đông cũ bị pha loãng tương ứng, "
+                                    "mọi chỉ số tính trên mỗi cổ phiếu đều giảm.")
+
+    # ── Nhận định tổng quát ──
+    npos, nneg = len(out["positives"]), len(out["negatives"])
+    if eq_score is not None:
+        if eq_score >= 5:
+            out["headline"] = "Doanh nghiệp đang hoạt động LÀNH MẠNH"
+            out["summary"] = ("Các chỉ tiêu cốt lõi đều tích cực và quan trọng nhất là lợi nhuận có dòng tiền "
+                              "thật đi kèm. Đây là loại doanh nghiệp có thể nắm giữ dài hơn nếu kỹ thuật ủng hộ.")
+        elif eq_score >= 1:
+            out["headline"] = "Hoạt động ỔN ĐỊNH, có điểm cần theo dõi"
+            out["summary"] = ("Nền tảng không có vấn đề lớn nhưng cũng chưa nổi bật. "
+                              "Phù hợp giao dịch theo tín hiệu kỹ thuật với tỷ trọng tiêu chuẩn.")
+        elif eq_score >= -2:
+            out["headline"] = "Hoạt động TRUNG BÌNH, tiềm ẩn rủi ro"
+            out["summary"] = ("Có những khoản mục đáng lưu ý trong báo cáo. Nếu giao dịch, nên coi là "
+                              "lệnh ngắn hạn theo kỹ thuật với cắt lỗ chặt, không nắm giữ dài hạn.")
+        else:
+            out["headline"] = "Báo cáo tài chính CÓ VẤN ĐỀ"
+            out["summary"] = ("Nhiều dấu hiệu cảnh báo cùng xuất hiện. Đây là nhóm mã mà tin xấu thường "
+                              "đến sau khi số liệu đã xấu vài quý. Rủi ro cao hơn hẳn phần lợi nhuận kỳ vọng.")
+    else:
+        out["headline"] = "Chưa đủ dữ liệu để kết luận"
+        out["summary"] = "Nguồn dữ liệu không trả đủ chỉ tiêu để đánh giá."
+    out["n_pos"], out["n_neg"] = npos, nneg
+    return out
 
 # ── B3: Percentile định giá lịch sử ──────────────────────────────────────────
 def valuation_percentile(price_df, q, lookback_quarters=12):
@@ -2708,6 +2929,14 @@ try:
     if qdata: val_pct_info = valuation_percentile(df_raw, qdata)
 except Exception:
     val_pct_info = None
+biz_verdict = None
+try:
+    if qdata and qdata.get("n_quarters", 0) >= 2:
+        biz_verdict = business_verdict(qdata,
+            next((k for k, v in SECTOR_PEERS.items() if symbol in v), "Khác"),
+            eq_score, eq_facts)
+except Exception:
+    biz_verdict = None
 cur_sector_g = next((k for k, v in SECTOR_PEERS.items() if symbol in v), "Khác")
 try:
     comp_dec = composite_decision(qdec, eq_score,
@@ -4666,27 +4895,110 @@ with tab10:
                        "Doanh nghiệp báo lãi lớn nhưng dòng tiền hoạt động âm kéo dài là mẫu hình "
                        "xuất hiện trước phần lớn các vụ vỡ nợ và điều chỉnh hồi tố báo cáo.")
 
-        # ── 2. Diễn biến các chỉ tiêu chính ──
-        st.markdown("#### 📈 Diễn biến theo quý")
+        # ── 2. NHẬN XÉT TRỰC TIẾP VỀ DOANH NGHIỆP ──
+        if biz_verdict:
+            _bv=biz_verdict
+            _hc=("#00d97e" if "LÀNH MẠNH" in _bv["headline"] else
+                 "#7fcf50" if "ỔN ĐỊNH" in _bv["headline"] else
+                 "#f5a623" if "TRUNG BÌNH" in _bv["headline"] else "#ff3d5a")
+            st.markdown("#### 🧠 Doanh nghiệp này đang làm ăn ra sao?")
+            st.markdown(f"""<div style='background:linear-gradient(135deg,{_hc}18,#0c1d2e);
+              border-left:5px solid {_hc};border-radius:0 12px 12px 0;padding:14px 18px;margin:6px 0;'>
+              <div style='font-size:19px;font-weight:800;color:{_hc};margin-bottom:6px;'>{_bv['headline']}</div>
+              <div style='font-size:13px;color:#cce0ff;line-height:1.7;'>{_bv['summary']}</div>
+              <div style='font-size:11px;color:#6a9cc8;margin-top:8px;'>Dựa trên báo cáo quý {_bv['quarter']}</div>
+            </div>""",unsafe_allow_html=True)
+            vc1,vc2=st.columns(2)
+            with vc1:
+                st.markdown(f"**✅ Điểm tích cực ({_bv['n_pos']})**")
+                if _bv["positives"]:
+                    for _t in _bv["positives"]: st.markdown(f"- {_t}")
+                else: st.caption("Không có điểm nào nổi bật.")
+            with vc2:
+                st.markdown(f"**⚠️ Điểm đáng lo ({_bv['n_neg']})**")
+                if _bv["negatives"]:
+                    for _t in _bv["negatives"]: st.markdown(f"- {_t}")
+                else: st.caption("Không phát hiện dấu hiệu bất thường.")
+            if _bv["neutrals"]:
+                with st.expander("Các quan sát khác"):
+                    for _t in _bv["neutrals"]: st.markdown(f"- {_t}")
+
+        # ── 3. Diễn biến theo quý ──
+        st.markdown("#### 📈 Diễn biến kinh doanh theo quý")
         _qc=_qcols(qdata["inc"])
-        if len(_qc)>=4:
+        if len(_qc)>=3:
+            _lbl=[str(c).replace("-Q","·Q") for c in _qc]
             _rev=_qseries('revenue',qdata["inc"],_qc)
             _np=_qseries('net_profit',qdata["inc"],_qc)
+            _gp=_qseries('gross_profit',qdata["inc"],_qc)
             _ocf=_qseries('ocf',qdata["cf"],_qc)
-            fig_q=make_subplots(rows=1,cols=2,subplot_titles=("Doanh thu & LNST theo quý",
-                                                              "Dòng tiền hoạt động vs LNST"))
-            fig_q.add_trace(go.Bar(x=_qc,y=_rev,name="Doanh thu",marker_color="#4a9ef8",opacity=.75),row=1,col=1)
-            fig_q.add_trace(go.Scatter(x=_qc,y=_np,name="LNST",mode="lines+markers",
-                line=dict(color="#00d97e",width=2.5)),row=1,col=1)
-            if any(v is not None for v in _ocf):
-                fig_q.add_trace(go.Bar(x=_qc,y=_ocf,name="Dòng tiền HĐ",marker_color="#22d3ee",opacity=.75),row=1,col=2)
-            fig_q.add_trace(go.Scatter(x=_qc,y=_np,name="LNST",mode="lines+markers",
-                line=dict(color="#f5a623",width=2),showlegend=False),row=1,col=2)
-            fig_q.update_layout(height=320,template="plotly_dark",**CHART_STYLE)
-            for a in fig_q.layout.annotations: a.font.color="#8baed4"; a.font.size=11
-            st.plotly_chart(fig_q,use_container_width=True)
-            st.caption("Ở biểu đồ phải: cột dòng tiền thấp hơn hẳn đường LNST một cách dai dẳng "
-                       "nghĩa là lợi nhuận chưa chuyển thành tiền thật.")
+            _B=1e9   # quy về tỷ đồng cho dễ đọc
+            def _sc(a): return [(v/_B if v is not None else None) for v in a]
+            _has=lambda a: any(v is not None for v in a)
+
+            if _has(_rev) or _has(_np):
+                fig_a=make_subplots(specs=[[{"secondary_y":True}]])
+                if _has(_rev):
+                    fig_a.add_trace(go.Bar(x=_lbl,y=_sc(_rev),name="Doanh thu (tỷ)",
+                        marker_color="#2a5a8a",opacity=.85),secondary_y=False)
+                if _has(_np):
+                    _npc=["#00d97e" if (v or 0)>=0 else "#ff3d5a" for v in _np]
+                    fig_a.add_trace(go.Bar(x=_lbl,y=_sc(_np),name="Lợi nhuận sau thuế (tỷ)",
+                        marker_color=_npc),secondary_y=False)
+                if _has(_rev) and _has(_gp):
+                    _gm=[(g/r*100 if (g is not None and r) else None) for g,r in zip(_gp,_rev)]
+                    if _has(_gm):
+                        fig_a.add_trace(go.Scatter(x=_lbl,y=_gm,name="Biên lợi nhuận gộp (%)",
+                            mode="lines+markers",line=dict(color="#f5a623",width=2.5),
+                            marker=dict(size=7)),secondary_y=True)
+                fig_a.update_layout(height=340,barmode="group",
+                    title="Doanh thu · Lợi nhuận · Biên lợi nhuận gộp",
+                    template="plotly_dark",**CHART_STYLE)
+                fig_a.update_yaxes(title_text="Tỷ đồng",secondary_y=False)
+                fig_a.update_yaxes(title_text="Biên gộp %",secondary_y=True,showgrid=False)
+                fig_a.layout.title.font.color="#8baed4"; fig_a.layout.title.font.size=13
+                st.plotly_chart(fig_a,use_container_width=True)
+                st.caption("Cột xanh đậm = doanh thu, cột xanh lá/đỏ = lợi nhuận, đường vàng = biên lợi nhuận gộp. "
+                           "Doanh thu tăng mà biên gộp đi xuống nghĩa là bán nhiều hơn nhưng lãi mỏng đi.")
+
+            if _has(_ocf) and _has(_np):
+                fig_b=go.Figure()
+                fig_b.add_trace(go.Bar(x=_lbl,y=_sc(_ocf),name="Dòng tiền kinh doanh (tỷ)",
+                    marker_color=["#22d3ee" if (v or 0)>=0 else "#cc1133" for v in _ocf],opacity=.9))
+                fig_b.add_trace(go.Scatter(x=_lbl,y=_sc(_np),name="Lợi nhuận sau thuế (tỷ)",
+                    mode="lines+markers",line=dict(color="#f5a623",width=2.5),marker=dict(size=8)))
+                fig_b.add_hline(y=0,line=dict(color="rgba(255,255,255,.35)",width=1))
+                fig_b.update_layout(height=300,title="Lợi nhuận có kèm TIỀN THẬT không?",
+                    template="plotly_dark",**CHART_STYLE)
+                fig_b.update_yaxes(title_text="Tỷ đồng")
+                fig_b.layout.title.font.color="#8baed4"; fig_b.layout.title.font.size=13
+                st.plotly_chart(fig_b,use_container_width=True)
+                st.caption("**Biểu đồ quan trọng nhất.** Cột (dòng tiền) nên bám sát hoặc cao hơn đường (lợi nhuận). "
+                           "Cột thấp hơn đường kéo dài nhiều quý = lợi nhuận chỉ nằm trên giấy. "
+                           "Cột âm trong khi đường dương = cảnh báo nghiêm trọng.")
+
+            _rec=_qseries('receivables',qdata["bal"],_qc)
+            _inv=_qseries('inventory',qdata["bal"],_qc)
+            if (_has(_rec) or _has(_inv)) and _has(_rev):
+                fig_c=go.Figure()
+                if _has(_rec):
+                    fig_c.add_trace(go.Scatter(x=_lbl,y=_sc(_rec),name="Phải thu (tỷ)",
+                        mode="lines+markers",line=dict(color="#a78bfa",width=2)))
+                if _has(_inv):
+                    fig_c.add_trace(go.Scatter(x=_lbl,y=_sc(_inv),name="Tồn kho (tỷ)",
+                        mode="lines+markers",line=dict(color="#ff8c42",width=2)))
+                fig_c.add_trace(go.Scatter(x=_lbl,y=_sc(_rev),name="Doanh thu (tỷ)",
+                    mode="lines",line=dict(color="#4a9ef8",width=2,dash="dot")))
+                fig_c.update_layout(height=280,title="Phải thu & Tồn kho so với Doanh thu",
+                    template="plotly_dark",**CHART_STYLE)
+                fig_c.update_yaxes(title_text="Tỷ đồng")
+                fig_c.layout.title.font.color="#8baed4"; fig_c.layout.title.font.size=13
+                st.plotly_chart(fig_c,use_container_width=True)
+                st.caption("Nếu đường phải thu hoặc tồn kho dốc lên nhanh hơn hẳn đường doanh thu, "
+                           "doanh nghiệp đang bán chịu nhiều hơn hoặc hàng bị ứ — cả hai đều là rủi ro.")
+        else:
+            st.info(f"Chỉ có {len(_qc)} quý dữ liệu — cần tối thiểu 3 quý để vẽ biểu đồ diễn biến.")
+
 
         # ── 3. Định giá so với chính lịch sử ──
         st.markdown("#### 💰 Định giá so với chính lịch sử mã này")
