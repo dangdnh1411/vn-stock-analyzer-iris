@@ -2819,7 +2819,7 @@ chg=float(lat.Close)-float(prev.Close); pct_chg=chg/float(prev.Close)*100 if flo
 chg_str=f"{'▲' if chg>=0 else '▼'} {abs(chg):,.0f} đ ({abs(pct_chg):.2f}%)"
 st.caption(f"📡 Nguồn: {price_src} · {len(df)} phiên · {'🟢' if chg>=0 else '🔴'} {chg_str} · {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
 
-tab1,tab_bctc,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10=st.tabs(["📉 Kỹ thuật","📑 Phân tích BCTC","📊 Cơ bản","💰 Dòng tiền","🏭 Ngành","🔍 Quét mã","📰 Tin tức","🎯 Tổng hợp","📐 Quant Portfolio","🩸 Bắt đáy hoảng loạn","🧾 Chất lượng lợi nhuận"])
+tab1,tab_bctc,tab_flow,tab_vn,tab_jr,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10=st.tabs(["📉 Kỹ thuật","📑 Phân tích BCTC","🌊 Dòng tiền & Volume","🇻🇳 Thị trường VN","📒 Nhật ký lệnh","📊 Cơ bản","💰 Dòng tiền","🏭 Ngành","🔍 Quét mã","📰 Tin tức","🎯 Tổng hợp","📐 Quant Portfolio","🩸 Bắt đáy hoảng loạn","🧾 Chất lượng lợi nhuận"])
 
 # ── TAB 1: KỸ THUẬT ────────────────────────────────────────────────────────
 with tab1:
@@ -3037,6 +3037,24 @@ with tab_bctc:
         import traceback as _tb
         with st.expander("Chi tiết kỹ thuật (gửi đoạn này để sửa lỗi)"):
             st.code(_tb.format_exc())
+
+# ── 3 TAB MỚI: DÒNG TIỀN & VOLUME · THỊ TRƯỜNG VN · NHẬT KÝ LỆNH (vn_tabs.py) ──
+def _render_safe(fn, *args):
+    try:
+        fn(*args)
+    except Exception as _e:
+        st.error(f"Lỗi hiển thị: `{type(_e).__name__}: {_e}`")
+        import traceback as _tb
+        with st.expander("Chi tiết kỹ thuật (gửi đoạn này để sửa lỗi)"):
+            st.code(_tb.format_exc())
+
+import vn_tabs
+with tab_flow:
+    _render_safe(vn_tabs.render_flow, symbol, CHART_STYLE)
+with tab_vn:
+    _render_safe(vn_tabs.render_market, symbol, CHART_STYLE)
+with tab_jr:
+    _render_safe(vn_tabs.render_journal, CHART_STYLE)
 
 # ── TAB 2: CƠ BẢN ──────────────────────────────────────────────────────────
 with tab2:
