@@ -1,6 +1,8 @@
-streamlit>=1.32.0
-pandas>=2.0.0
-numpy>=1.24.0
-plotly>=5.18.0
-requests>=2.31.0
+# Không dùng vnstock (đã bị gỡ khỏi PyPI 10/2026) — dữ liệu lấy trực tiếp qua vn_data.py
+# Chặn phiên bản lớn tiếp theo để app không tự vỡ khi thư viện ra bản mới đổi API
+streamlit>=1.32,<2
+pandas>=2.0,<3
+numpy>=1.24,<3
+plotly>=5.18,<8
+requests>=2.31,<3
 yfinance>=0.2.40

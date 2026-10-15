@@ -1,7 +1,7 @@
 """
-Pro Trader Terminal v5.2
-Data: vnstock KBS (KB Securities) — không cần API key, hoạt động mọi môi trường
-Tested: logic verified với 20/20 unit tests
+Pro Trader Terminal v6.0
+Data: KBS (giá) + Vietcap IQ (BCTC, chỉ số, hồ sơ, tin) — gọi trực tiếp, không cần vnstock/API key
+v6.0 (10/2026): bỏ vnstock (bị gỡ khỏi PyPI), thêm tab "Phân tích BCTC" (fin_analysis.py)
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -78,7 +78,13 @@ CHART_STYLE = dict(
     yaxis=dict(showgrid=True, gridcolor="#102030", gridwidth=0.5, tickfont=dict(color="#4a6080",size=10)),
 )
 
-# ══════════════════════════════ DATA LAYER (vnstock KBS) ══════════════════════
+# ══════════════════════════════ DATA LAYER (KBS + Vietcap, không cần vnstock) ══════════════════════
+# 10/2026: vnstock bị gỡ khỏi PyPI → app gọi thẳng API công khai qua vn_data.py.
+#   Giá: KBS (chính) → Yahoo (dự phòng) · BCTC/chỉ số/hồ sơ/tin: Vietcap IQ · Bảng giá: Vietcap
+import vn_data as vnd
+import fin_analysis as fa
+
+
 def _dedupe_dates(df):
     """Khử ngày trùng lặp trong dữ liệu giá.
     Nguồn dữ liệu hay trả thêm dòng ở ngày GDKHQ (chia cổ tức/cổ phiếu thưởng) hoặc
@@ -90,92 +96,28 @@ def _dedupe_dates(df):
         out = out.sort_values("Date").drop_duplicates(subset="Date", keep="last")
     return out.reset_index(drop=True)
 
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_price(sym: str, days: int, interval: str):
-    """Lấy dữ liệu giá từ KBS. Trả về (df, source_note)."""
-    end   = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    try:
-        from vnstock import Quote
-        q  = Quote(symbol=sym.upper(), source="KBS")
-        df = q.history(start=start, end=end, interval=interval)
-        if df.empty: raise ValueError("Empty data from KBS")
-        # Chuẩn hoá cột
-        df = df.rename(columns={"time":"Date","open":"Open","high":"High",
-                                 "low":"Low","close":"Close","volume":"Volume"})
-        # KBS chia giá /1000 trong module → nhân lại cho VN stocks (đã handle trong vnstock)
-        for col in ["Open","High","Low","Close"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            # Nếu giá < 1000 có thể vẫn dạng đơn vị nghìn đồng
-            if df[col].median() < 1000:
-                df[col] = df[col] * 1000
-        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
-        df["Date"]   = pd.to_datetime(df["Date"])
-        df = df.sort_values("Date").reset_index(drop=True)
-        return _dedupe_dates(df[["Date","Open","High","Low","Close","Volume"]]), "KBS (KB Securities) ✅"
-    except Exception as e1:
-        # Fallback yfinance
-        try:
-            import yfinance as yf
-            df = yf.download(f"{sym}.VN", start=start, end=end, progress=False, auto_adjust=True)
-            if df.empty: raise ValueError("yfinance empty")
-            df = df.reset_index()
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            df = df.rename(columns={"Date":"Date","Open":"Open","High":"High",
-                                     "Low":"Low","Close":"Close","Volume":"Volume"})
-            for col in ["Open","High","Low","Close"]: df[col]=pd.to_numeric(df[col],errors="coerce")
-            df["Volume"]=pd.to_numeric(df["Volume"],errors="coerce").fillna(0).astype(int)
-            df=df.sort_values("Date").reset_index(drop=True)
-            return _dedupe_dates(df[["Date","Open","High","Low","Close","Volume"]]), "Yahoo Finance ⚠️"
-        except Exception as e2:
-            raise RuntimeError(f"KBS: {e1} | Yahoo: {e2}")
+    """Giá lịch sử: KBS → Yahoo. Trả (df, nhãn nguồn). Đơn vị: đồng."""
+    df, src = vnd.get_history(sym.upper(), days, interval)
+    return _dedupe_dates(df), src
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_vnindex(days: int):
-    """QUANT: Lấy dữ liệu VN-Index — dùng cho RS Line (Tab Kỹ thuật) và Beta (Tab Quant Portfolio).
-    Thử lần lượt vài mã/nguồn vì tick VN-Index có thể khác nhau tùy nguồn vnstock.
-    KHÔNG áp dụng scaling ×1000 như cổ phiếu (index là điểm số, không phải giá VND)."""
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    candidates = [("VNINDEX", "KBS"), ("VNINDEX", "VCI"), ("VNI", "KBS")]
-    for sym_try, src in candidates:
-        try:
-            from vnstock import Quote
-            q = Quote(symbol=sym_try, source=src)
-            df = q.history(start=start, end=end, interval="1D")
-            if df is None or df.empty: continue
-            df = df.rename(columns={"time": "Date", "open": "Open", "high": "High",
-                                     "low": "Low", "close": "Close", "volume": "Volume"})
-            for col in ["Open", "High", "Low", "Close"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.sort_values("Date").reset_index(drop=True)
-            if df["Close"].isna().all() or len(df) < 5: continue
-            return _dedupe_dates(df[["Date", "Open", "High", "Low", "Close", "Volume"]]), f"{src} ({sym_try}) ✅"
-        except Exception:
-            continue
-    # Fallback Yahoo Finance (vnstock đã bị gỡ khỏi PyPI 10/2026)
+    """VN-Index cho RS Line & Beta. KBS → Yahoo (^VNINDEX.VN). Không nhân ×1000 (đơn vị điểm)."""
     try:
-        import yfinance as yf
-        df = yf.download("^VNINDEX.VN", start=start, end=end, progress=False, auto_adjust=True)
-        if df is not None and not df.empty:
-            df = df.reset_index()
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            for col in ["Open", "High", "Low", "Close"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
-            df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-            df = df.sort_values("Date").reset_index(drop=True)
-            if len(df) >= 5:
-                return _dedupe_dates(df[["Date", "Open", "High", "Low", "Close", "Volume"]]), "Yahoo (^VNINDEX.VN) ⚠️"
+        df, src = vnd.get_history("VNINDEX", days, "1D")
+        if df is not None and len(df) >= 5:
+            return _dedupe_dates(df), f"{src.split(' ')[0]} (VNINDEX) ✅"
     except Exception:
         pass
     return pd.DataFrame(), "Không lấy được VN-Index"
 
-@st.cache_data(ttl=300, show_spinner=False)
+
 def _flatten_vci_cols(df):
-    """Flatten MultiIndex columns của VCI, giữ TÊN ĐẦY ĐỦ field + đảm bảo duy nhất."""
+    """Giữ lại cho tương thích ngược (dữ liệu VCI dạng cột MultiIndex)."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
     seen = {}; new_cols = []
@@ -188,235 +130,138 @@ def _flatten_vci_cols(df):
     df.columns = new_cols
     return df
 
-@st.cache_data(ttl=60, show_spinner=False)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fin_bundle(sym: str) -> dict:
+    """Trọn bộ BCTC năm + quý, chỉ số TTM, hồ sơ DN của 1 mã — 1 lần tải, dùng cho mọi tab.
+    BCTC chỉ đổi 4 lần/năm nên cache 30 phút là đủ."""
+    return vnd.get_financials(sym.upper())
+
+
 def fetch_ratio(sym: str):
-    """Chỉ số tài chính: KBS primary (có eps, earnings_per_share) → VCI fallback → trống."""
-    sym = sym.upper()
-    # Nguồn 1: KBS — item_id chuẩn hóa, có eps trong ratio
-    try:
-        from vnstock import Finance
-        fin = Finance(symbol=sym, source="KBS")
-        df = fin.ratio(period="year")
-        if df is not None and not df.empty:
-            return df, "KBS ✅"
-    except Exception:
-        pass
-    # Nguồn 2: VCI fallback
-    try:
-        from vnstock import Finance
-        fin = Finance(symbol=sym, source="VCI")
-        df = fin.ratio(period="year", lang="en", dropna=False)
-        if df is not None and not df.empty:
-            df = _flatten_vci_cols(df)
-            yc = next((c for c in df.columns if 'year' in str(c).lower()), None)
-            if yc:
-                df = df.sort_values(yc).reset_index(drop=True)
-            return df, "VCI ✅"
-    except Exception:
-        pass
-    return pd.DataFrame(), "Không lấy được chỉ số"
+    """Chỉ số tài chính theo năm (dạng DÀI: item_id + cột năm, thêm cột TTM mới nhất)."""
+    b = fetch_fin_bundle(sym)
+    df = b.get("ratio_y", pd.DataFrame())
+    if df is not None and not df.empty:
+        return df, "Vietcap ✅"
+    return pd.DataFrame(), "Không lấy được chỉ số" + (f" ({'; '.join(b.get('errors', [])[:2])})" if b.get("errors") else "")
 
-@st.cache_data(ttl=300, show_spinner=False)
+
 def fetch_income(sym: str) -> pd.DataFrame:
-    """KQKD: KBS primary (có eps item_id='eps') → VCI fallback."""
-    sym = sym.upper()
-    # KBS income có 'eps' → normalized → item_id='eps'
-    try:
-        from vnstock import Finance
-        fin = Finance(symbol=sym, source="KBS")
-        df = fin.income_statement(period="year")
-        if df is not None and not df.empty:
-            yc = next((c for c in df.columns if "year" in c.lower() or "năm" in c.lower()), None)
-            if yc:
-                df = df.sort_values(yc, ascending=True).reset_index(drop=True)
-            return df
-    except Exception:
-        pass
-    # VCI fallback
-    try:
-        from vnstock import Finance
-        fin = Finance(symbol=sym, source="VCI")
-        df = fin.income_statement(period="year", lang="en", dropna=False)
-        if df is not None and not df.empty:
-            df = _flatten_vci_cols(df)
-            yc = next((c for c in df.columns if 'year' in str(c).lower()), None)
-            if yc:
-                df = df.sort_values(yc).reset_index(drop=True)
-            return df
-    except Exception:
-        pass
-    except:
-        pass
-    return pd.DataFrame()
+    return fetch_fin_bundle(sym).get("inc_y", pd.DataFrame())
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def fetch_balance(sym):
-    try:
-        from vnstock import Finance
-        df=Finance(symbol=sym,source="KBS").balance_sheet(period="year")
-        return df if df is not None and not df.empty else pd.DataFrame()
-    except: return pd.DataFrame()
+    return fetch_fin_bundle(sym).get("bal_y", pd.DataFrame())
 
-@st.cache_data(ttl=300, show_spinner=False)
+
 def fetch_cashflow_stmt(sym):
-    try:
-        from vnstock import Finance
-        df=Finance(symbol=sym,source="KBS").cash_flow(period="year")
-        return df if df is not None and not df.empty else pd.DataFrame()
-    except: return pd.DataFrame()
+    return fetch_fin_bundle(sym).get("cf_y", pd.DataFrame())
 
-@st.cache_data(ttl=300, show_spinner=False)
+
 def fetch_tcbs_extras(sym):
-    """TCBS: overview + price_target."""
-    out={}
-    base="https://apipubaws.tcbs.com.vn"
-    hdrs={"User-Agent":"Mozilla/5.0","Accept":"application/json",
-          "Referer":"https://tcinvest.tcbs.com.vn/","Origin":"https://tcinvest.tcbs.com.vn"}
-    try:
-        import requests as _r
-        r=_r.get(f"{base}/tcanalysis/v1/ticker/{sym}/overview",headers=hdrs,timeout=8)
-        if r.status_code==200: out['overview']=r.json()
-    except: pass
-    try:
-        import requests as _r
-        r=_r.get(f"{base}/tcanalysis/v1/ticker/{sym}/priceTarget",headers=hdrs,timeout=8)
-        if r.status_code==200:
-            d=r.json(); rows=d if isinstance(d,list) else d.get("data",[])
-            if rows: out['price_target']=rows
-    except: pass
+    """(Tên giữ nguyên cho tương thích) — TCBS đã đóng API công khai (404).
+    Nay lấy vốn hoá + giá mục tiêu từ hồ sơ Vietcap."""
+    det = fetch_fin_bundle(sym).get("details") or {}
+    out = {}
+    if det:
+        out["overview"] = {"marketCap": det.get("marketCap"), "sector": det.get("sectorVn"),
+                           "foreignPercent": det.get("foreignerPercentage")}
+        if det.get("targetPrice"):
+            out["price_target"] = [{"firm": "Vietcap", "targetPrice": det.get("targetPrice"),
+                                    "action": det.get("rating"), "date": det.get("ratingAsOf")}]
     return out
 
-@st.cache_data(ttl=300, show_spinner=False)
+
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_tcbs_news(sym):
+    """(Tên giữ nguyên) — tin doanh nghiệp từ Vietcap IQ."""
     try:
-        import requests as _r
-        hdrs={"User-Agent":"Mozilla/5.0","Accept":"application/json",
-              "Referer":"https://tcinvest.tcbs.com.vn/","Origin":"https://tcinvest.tcbs.com.vn"}
-        r=_r.get(f"https://apipubaws.tcbs.com.vn/tcanalysis/v1/ticker/{sym}/activity-news",
-                 params={"page":0,"size":15},headers=hdrs,timeout=10)
-        if r.status_code==200:
-            d=r.json(); items=d if isinstance(d,list) else d.get("listActivityNews",d.get("data",[]))
-            return items[:15]
-    except: pass
-    return []
+        return vnd.get_news(sym, days=180, size=15)
+    except Exception:
+        return []
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news_ai(sym, sector=""):
+    """Tìm tin bằng Claude + web search. CẦN khoá API: đặt ANTHROPIC_API_KEY trong
+    Settings → Secrets của Streamlit Cloud. Không có khoá → trả rỗng (không làm sập app)."""
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
+    except Exception:
+        api_key = None
+    if not api_key:
+        return {"news": [], "key_events": [], "error": "Chưa cấu hình ANTHROPIC_API_KEY"}
     prompt = ("Search latest news Vietnam stock " + sym + " last 7 days. "
               "Find: earnings, analyst ratings, business events. Sector: " + sector + ". "
               "Return ONLY valid JSON with keys: news (list of objects with date/title/summary/sentiment), "
-              "key_events (list of strings). Example: " + '{}'.format(""))
+              "key_events (list of strings).")
     try:
-        payload=json.dumps({"model":"claude-haiku-4-5-20251001","max_tokens":2000,
-            "tools":[{"type":"web_search_20250305","name":"web_search"}],
-            "messages":[{"role":"user","content":prompt}]}).encode()
-        req=urllib.request.Request("https://api.anthropic.com/v1/messages",
-            data=payload,headers={"Content-Type":"application/json"},method="POST")
-        with urllib.request.urlopen(req,timeout=45) as resp:
-            result=json.loads(resp.read())
-        text=" ".join(c.get("text","") for c in result.get("content",[]) if c.get("type")=="text")
-        candidates=[]; depth=0; start=-1
-        for i,ch in enumerate(text):
-            if ch=='{':
-                if depth==0: start=i
-                depth+=1
-            elif ch=='}':
-                depth-=1
-                if depth==0 and start>=0: candidates.append(text[start:i+1])
-        candidates.sort(key=len,reverse=True)
+        payload = json.dumps({"model": "claude-haiku-4-5-20251001", "max_tokens": 2000,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}]}).encode()
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload,
+            headers={"Content-Type": "application/json", "x-api-key": api_key,
+                     "anthropic-version": "2023-06-01"}, method="POST")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            result = json.loads(resp.read())
+        text = " ".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+        candidates = []; depth = 0; start = -1
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if depth == 0: start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0: candidates.append(text[start:i+1])
+        candidates.sort(key=len, reverse=True)
         for c in candidates:
             try:
-                d=json.loads(c)
+                d = json.loads(c)
                 if "news" in d: return d
-            except: pass
-    except: pass
-    return {"news":[],"key_events":[]}
+            except Exception:
+                pass
+    except Exception as e:
+        return {"news": [], "key_events": [], "error": f"{type(e).__name__}"}
+    return {"news": [], "key_events": []}
+
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_price_board(symbols):
-    """Lấy giá + thay đổi của nhiều mã trong 1 request (VCI). Cho screener/ngành."""
-    out = {}
+    """Giá + % thay đổi của nhiều mã trong 1 request (Vietcap). {sym: {price, chg}}"""
     try:
-        from vnstock import Trading
-        tb = Trading(source="VCI")
-        df = tb.price_board(symbols, flatten_columns=True)
-        if df is not None and not df.empty:
-            # Tìm cột symbol và giá
-            cols = {c.lower(): c for c in df.columns}
-            sym_c = next((cols[k] for k in cols if 'symbol' in k), None)
-            price_c = next((cols[k] for k in cols if 'match' in k and 'price' in k), None)
-            if not price_c:
-                price_c = next((cols[k] for k in cols if k.endswith('matchprice') or 'closeprice' in k or k=='match_match_price'), None)
-            ref_c = next((cols[k] for k in cols if 'refprice' in k or 'ref_price' in k), None)
-            for _, row in df.iterrows():
-                s = str(row[sym_c]).upper() if sym_c else None
-                if not s: continue
-                price = pd.to_numeric(row[price_c], errors='coerce') if price_c else None
-                ref = pd.to_numeric(row[ref_c], errors='coerce') if ref_c else None
-                chg = ((price-ref)/ref*100) if (price and ref and ref>0) else 0
-                out[s] = {'price': float(price) if pd.notna(price) else None,
-                          'chg': float(chg) if pd.notna(chg) else 0}
+        return vnd.price_board(list(symbols))
     except Exception:
-        pass
-    return out
+        return {}
 
-@st.cache_data(ttl=300, show_spinner=False)
+
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_vci_news(sym):
-    """Tin tức từ VCI Company.news() — nguồn ổn định hơn TCBS trên cloud."""
+    """Tin doanh nghiệp từ Vietcap IQ (khoá 'title', 'date')."""
     try:
-        from vnstock.explorer.vci.company import Company
-        co = Company(symbol=sym.upper())
-        df = co.news()
-        if df is not None and not df.empty:
-            return df.head(12).to_dict("records")
+        return vnd.get_news(sym, days=180, size=12)
     except Exception:
-        pass
-    return []
+        return []
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def scan_stock_quick(sym, days=90):
-    """Lấy giá + chỉ báo kỹ thuật cho 1 mã. KBS → yfinance fallback."""
-    for source in ["KBS", "yf"]:
-        try:
-            if source == "KBS":
-                from vnstock import Quote
-                end = (datetime.now()).strftime("%Y-%m-%d")
-                start = (datetime.now()-timedelta(days=days)).strftime("%Y-%m-%d")
-                raw = Quote(symbol=sym.upper(), source="KBS").history(
-                    start=start, end=end, interval="1D")
-                if raw is None or raw.empty: continue
-                raw = raw.rename(columns={"time":"Date","open":"Open","high":"High",
-                                          "low":"Low","close":"Close","volume":"Volume"})
-                for c in ["Open","High","Low","Close"]:
-                    raw[c] = pd.to_numeric(raw[c], errors="coerce")
-                    if raw[c].median() < 1000: raw[c] *= 1000
-                raw["Volume"] = pd.to_numeric(raw["Volume"], errors="coerce").fillna(0).astype(int)
-                raw["Date"] = pd.to_datetime(raw["Date"])
-                df2 = raw.sort_values("Date").reset_index(drop=True)
-            else:
-                import yfinance as yf
-                df2 = yf.download(f"{sym}.VN", period=f"{days}d",
-                                  interval="1d", progress=False, auto_adjust=True)
-                if df2.empty: continue
-                df2 = df2.reset_index()
-                df2.columns = [c[0] if isinstance(c,tuple) else c for c in df2.columns]
-                df2 = df2.rename(columns={"Date":"Date","Open":"Open","High":"High",
-                                          "Low":"Low","Close":"Close","Volume":"Volume"})
-            if df2 is None or len(df2) < 30: continue
-            df2i = add_indicators(df2)
-            s2, _, sc2 = calc_signal(df2i)
-            lat2 = df2i.iloc[-1]
-            chg1d = (float(lat2.Close)-float(df2i.iloc[-2].Close))/float(df2i.iloc[-2].Close)*100 if len(df2i)>1 else 0
-            chg5d = (float(lat2.Close)-float(df2i.iloc[-5].Close))/float(df2i.iloc[-5].Close)*100 if len(df2i)>5 else 0
-            cmf = float(lat2.CMF) if "CMF" in df2i.columns and pd.notna(lat2.CMF) else 0.0
-            return dict(sym=sym, sig=s2, score=sc2, close=float(lat2.Close),
-                        chg1d=chg1d, chg5d=chg5d, rsi=float(lat2.RSI),
-                        adx=float(lat2.ADX) if pd.notna(lat2.ADX) else 0,
-                        vol_ratio=float(lat2.Vol_Ratio), cmf=cmf)
-        except Exception:
-            continue
-    return None
+    """Lấy giá + chỉ báo kỹ thuật cho 1 mã (KBS → Yahoo)."""
+    try:
+        df2, _ = fetch_price(sym, days, "1D")
+        if df2 is None or len(df2) < 30: return None
+        df2i = add_indicators(df2)
+        s2, _, sc2 = calc_signal(df2i)
+        lat2 = df2i.iloc[-1]
+        chg1d = (float(lat2.Close)-float(df2i.iloc[-2].Close))/float(df2i.iloc[-2].Close)*100 if len(df2i)>1 else 0
+        chg5d = (float(lat2.Close)-float(df2i.iloc[-5].Close))/float(df2i.iloc[-5].Close)*100 if len(df2i)>5 else 0
+        cmf = float(lat2.CMF) if "CMF" in df2i.columns and pd.notna(lat2.CMF) else 0.0
+        return dict(sym=sym, sig=s2, score=sc2, close=float(lat2.Close),
+                    chg1d=chg1d, chg5d=chg5d, rsi=float(lat2.RSI),
+                    adx=float(lat2.ADX) if pd.notna(lat2.ADX) else 0,
+                    vol_ratio=float(lat2.Vol_Ratio), cmf=cmf)
+    except Exception:
+        return None
 
 @st.cache_data(ttl=300, show_spinner=False)
 def scan_stock_quant(sym, days=260, _vni_close=None):
@@ -1533,7 +1378,7 @@ def _qcols(df):
     """Nhận diện cột KỲ trong bảng theo quý. KBS trả dạng '2025-Q1' / '2025-Quý 1',
     một số nguồn trả '2025Q1' hoặc tách 2 cột year+quarter."""
     if df is None or df.empty: return []
-    meta = {'item','item_id','item_en','unit','levels','row_number','ticker','id'}
+    meta = {'item','item_id','item_en','unit','levels','row_number','ticker','id','field'}
     cands = []
     for c in df.columns:
         cs = str(c)
@@ -1606,40 +1451,15 @@ def _qseries(iid, df, cols):
     """Chuỗi giá trị của 1 chỉ tiêu qua các kỳ."""
     return [_qget(iid, df, c) for c in (cols or [])]
 
-@st.cache_data(ttl=600, show_spinner=False)
 def fetch_quarterly(sym: str):
-    """BCTC THEO QUÝ — cùng cơ chế KBS→VCI như dữ liệu năm đang chạy ổn.
-    Trả về dict {inc, bal, cf, ratio, source, n_quarters}."""
-    sym = sym.upper()
-    out = dict(inc=pd.DataFrame(), bal=pd.DataFrame(), cf=pd.DataFrame(),
-               ratio=pd.DataFrame(), source="Không lấy được", n_quarters=0)
-    def _dedup(d):
-        if d is None or d.empty: return pd.DataFrame()
-        seen={}; cols=[]
-        for c in d.columns:
-            c=str(c)
-            if c in seen: seen[c]+=1; cols.append(f"{c}__{seen[c]}")
-            else: seen[c]=0; cols.append(c)
-        d=d.copy(); d.columns=cols; return d
-    for src in ["KBS", "VCI"]:
-        try:
-            from vnstock import Finance
-            fin = Finance(symbol=sym, source=src)
-            inc = _dedup(fin.income_statement(period="quarter"))
-            if inc is None or inc.empty: continue
-            try: bal = _dedup(fin.balance_sheet(period="quarter"))
-            except Exception: bal = pd.DataFrame()
-            try: cf = _dedup(fin.cash_flow(period="quarter"))
-            except Exception: cf = pd.DataFrame()
-            try: rat = _dedup(fin.ratio(period="quarter"))
-            except Exception: rat = pd.DataFrame()
-            nq = len(_qcols(inc))
-            out.update(inc=inc, bal=bal, cf=cf, ratio=rat,
-                       source=f"{src} ✅", n_quarters=nq)
-            return out
-        except Exception:
-            continue
-    return out
+    """BCTC THEO QUÝ (Vietcap IQ, ~34 quý). Trả dict {inc, bal, cf, ratio, source, n_quarters}.
+    Số quý là số RIÊNG từng quý (đã kiểm: tổng 4 quý = số cả năm), không phải luỹ kế."""
+    b = fetch_fin_bundle(sym)
+    inc = b.get("inc_q", pd.DataFrame())
+    nq = len(_qcols(inc)) if inc is not None and not inc.empty else 0
+    return dict(inc=inc, bal=b.get("bal_q", pd.DataFrame()), cf=b.get("cf_q", pd.DataFrame()),
+                ratio=b.get("ratio_q", pd.DataFrame()),
+                source="Vietcap ✅" if nq else "Không lấy được", n_quarters=nq)
 
 # ── B2: Chấm điểm CHẤT LƯỢNG LỢI NHUẬN ───────────────────────────────────────
 EQ_WEIGHTS = {
@@ -1931,6 +1751,25 @@ def valuation_percentile(price_df, q, lookback_quarters=12):
     Có sức tham chiếu tốt hơn so sánh chéo ngành, vì mỗi doanh nghiệp có mặt bằng
     định giá riêng do mô hình kinh doanh và mức tăng trưởng khác nhau."""
     if price_df is None or price_df.empty or not q: return None
+    # Ưu tiên: chuỗi P/E cuối quý do Vietcap tính sẵn (~8 năm) — không phụ thuộc độ dài lịch sử
+    # giá đang chọn ở sidebar (mặc định 6 tháng chỉ có 2 mốc cuối quý → cách cũ luôn thiếu dữ liệu).
+    try:
+        rq = q.get("ratio"); rcols = _qcols(rq)
+        if rcols:
+            pts = [(c, p) for c, p in zip(rcols, vnd.row_values(rq, "pe_ratio", rcols))
+                   if p is not None and 0 < p < 80][-lookback_quarters:]
+            icols = _qcols(q.get("inc"))
+            npat = [v for v in vnd.row_values(q.get("inc"), "attributable_to_parent_company", icols[-4:]) if v is not None]
+            sh = vnd.row_values(rq, "shares_outstanding", rcols)[-1]
+            if len(pts) >= 4 and len(npat) == 4 and sh and sum(npat) > 0:
+                cur_eps = sum(npat) / sh
+                cur_pe = float(pd.to_numeric(price_df["Close"]).iloc[-1]) / cur_eps
+                h = pd.DataFrame([dict(quarter=c.replace("-", ""), pe=p) for c, p in pts])
+                return dict(current_pe=cur_pe, percentile=float((h["pe"] < cur_pe).mean() * 100), history=h,
+                            median_pe=float(h["pe"].median()), min_pe=float(h["pe"].min()),
+                            max_pe=float(h["pe"].max()), n_quarters=len(h), eps_ttm=cur_eps)
+    except Exception:
+        pass
     inc = q.get("inc"); cols = _qcols(inc)
     if len(cols) < 5: return None
     # EPS trượt 4 quý cho từng thời điểm
@@ -2530,7 +2369,7 @@ def kelly_fraction(win_rate: float, avg_win: float, avg_loss: float):
     return f
 
 # ══════════════════════════════ FUNDAMENTAL SCORING ════════════════════════════
-_META_COLS = ['item','item_id','item_en','unit','levels','row_number']
+_META_COLS = ['item','item_id','item_en','unit','levels','row_number','field']
 _GV_ALIASES = {
     'pe_ratio':           ['pe_ratio','p_e','pe'],
     'pb_ratio':           ['pb_ratio','p_b','pb'],
@@ -2809,12 +2648,13 @@ def score_pill(label, s, weight_pct):
 
 # ══════════════════════════════ SIDEBAR ════════════════════════════════════════
 with st.sidebar:
-    st.markdown("## 📈 Pro Trader v5")
+    st.markdown("## 📈 Pro Trader v6")
     st.markdown("---")
     symbol=st.text_input("Mã cổ phiếu",value="VPB",help="VD: VPB HPG VCB FPT MWG SSI TCB VIC ACB").upper().strip()
     res_label=st.selectbox("Độ phân giải nến",list(RESOLUTIONS.keys()),index=5)
     resolution=RESOLUTIONS[res_label]
-    per_label=st.selectbox("Lịch sử dữ liệu",list(PERIODS.keys()),index=2)
+    per_label=st.selectbox("Lịch sử dữ liệu",list(PERIODS.keys()),index=3,
+        help="Mặc định 1 năm: đủ phiên cho EMA200, đỉnh/đáy 52 tuần. 6 tháng sẽ tắt các bộ lọc dài hạn.")
     days=PERIODS[per_label]
     show_n=st.slider("Số nến hiển thị",30,300,100,10)
     st.markdown("**EMA hiển thị**")
@@ -2848,12 +2688,12 @@ if not (run or auto_r or clicked or _already_run):
       border-radius:12px;border:1px solid #163350;'>
       <div style='font-size:48px;'>📈</div>
       <div style='font-size:15px;color:#6a9cc8;margin-top:12px;'>Nhập mã cổ phiếu và nhấn <b style="color:#fff">Phân tích ngay</b></div>
-      <div style='font-size:11px;color:#3a6080;margin-top:6px;'>Nguồn dữ liệu: KBS (KB Securities) · Không cần API key</div>
+      <div style='font-size:11px;color:#3a6080;margin-top:6px;'>Nguồn: KBS (giá) · Vietcap (BCTC, chỉ số, tin) · Không cần API key</div>
     </div>""",unsafe_allow_html=True)
     st.stop()
 
 # Load dữ liệu
-with st.spinner(f"⏳ Đang tải {symbol} từ KBS..."):
+with st.spinner(f"⏳ Đang tải {symbol} (giá KBS + BCTC Vietcap)..."):
     try:
         df_raw, price_src = fetch_price(symbol, days, resolution)
     except Exception as e:
@@ -2979,7 +2819,7 @@ chg=float(lat.Close)-float(prev.Close); pct_chg=chg/float(prev.Close)*100 if flo
 chg_str=f"{'▲' if chg>=0 else '▼'} {abs(chg):,.0f} đ ({abs(pct_chg):.2f}%)"
 st.caption(f"📡 Nguồn: {price_src} · {len(df)} phiên · {'🟢' if chg>=0 else '🔴'} {chg_str} · {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
 
-tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10=st.tabs(["📉 Kỹ thuật","📊 Cơ bản","💰 Dòng tiền","🏭 Ngành","🔍 Quét mã","📰 Tin tức","🎯 Tổng hợp","📐 Quant Portfolio","🩸 Bắt đáy hoảng loạn","🧾 Chất lượng lợi nhuận"])
+tab1,tab_bctc,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10=st.tabs(["📉 Kỹ thuật","📑 Phân tích BCTC","📊 Cơ bản","💰 Dòng tiền","🏭 Ngành","🔍 Quét mã","📰 Tin tức","🎯 Tổng hợp","📐 Quant Portfolio","🩸 Bắt đáy hoảng loạn","🧾 Chất lượng lợi nhuận"])
 
 # ── TAB 1: KỸ THUẬT ────────────────────────────────────────────────────────
 with tab1:
@@ -3186,6 +3026,17 @@ with tab1:
         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
         st.caption("Điểm thô được chuẩn hoá về thang −10…+10 theo số cấu phần có đủ dữ liệu, "
                    "nên mã thiếu dữ liệu vẫn so sánh được công bằng với mã đủ dữ liệu.")
+
+# ── TAB BCTC: PHÂN TÍCH BÁO CÁO TÀI CHÍNH (bctc_tab.py + fin_analysis.py) ──
+with tab_bctc:
+    try:
+        import bctc_tab
+        bctc_tab.render(symbol, float(df_raw["Close"].iloc[-1]), fetch_fin_bundle(symbol), CHART_STYLE)
+    except Exception as _e:
+        st.error(f"Lỗi tab Phân tích BCTC: `{type(_e).__name__}: {_e}`")
+        import traceback as _tb
+        with st.expander("Chi tiết kỹ thuật (gửi đoạn này để sửa lỗi)"):
+            st.code(_tb.format_exc())
 
 # ── TAB 2: CƠ BẢN ──────────────────────────────────────────────────────────
 with tab2:
