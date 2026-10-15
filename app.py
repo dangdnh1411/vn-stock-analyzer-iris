@@ -155,7 +155,23 @@ def fetch_vnindex(days: int):
             return _dedupe_dates(df[["Date", "Open", "High", "Low", "Close", "Volume"]]), f"{src} ({sym_try}) ✅"
         except Exception:
             continue
-    return pd.DataFrame(), "Không lấy được VN-Index — kiểm tra lại mã index trên vnstock"
+    # Fallback Yahoo Finance (vnstock đã bị gỡ khỏi PyPI 10/2026)
+    try:
+        import yfinance as yf
+        df = yf.download("^VNINDEX.VN", start=start, end=end, progress=False, auto_adjust=True)
+        if df is not None and not df.empty:
+            df = df.reset_index()
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            for col in ["Open", "High", "Low", "Close"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
+            df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+            df = df.sort_values("Date").reset_index(drop=True)
+            if len(df) >= 5:
+                return _dedupe_dates(df[["Date", "Open", "High", "Low", "Close", "Volume"]]), "Yahoo (^VNINDEX.VN) ⚠️"
+    except Exception:
+        pass
+    return pd.DataFrame(), "Không lấy được VN-Index"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _flatten_vci_cols(df):
