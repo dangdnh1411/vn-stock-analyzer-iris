@@ -15,6 +15,7 @@ from plotly.subplots import make_subplots
 
 import flow_analysis as fl
 import journal as jr
+import swing_setups as ss
 import vn_data as vnd
 import vn_market as vm
 
@@ -81,6 +82,44 @@ def _peers(syms: tuple):
     return vm.peer_metrics(list(syms))
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _scan_swing(group: str, top_n: int = 120):
+    """Quét nhóm mã: giai đoạn xả cạn & cảnh báo bơm. Gọi thẳng nguồn dữ liệu trong luồng phụ (không qua cache)."""
+    from concurrent.futures import ThreadPoolExecutor
+    syms = vm.group_symbols(group)
+    if group in ("HOSE", "HNX", "UPCOM") and len(syms) > top_n:
+        bd = vm.board(syms)
+        if not bd.empty:
+            syms = bd.sort_values("value", ascending=False)["symbol"].head(top_n).tolist()
+        else:
+            syms = syms[:top_n]
+
+    def one(sym):
+        try:
+            px, _ = vnd.get_history(sym, 420, "1D")
+            if px is None or len(px) < 80:
+                return None
+            res = fl.analyze_flow(px)
+            sw = ss.analyze_swing(res["d"])
+            if not sw:
+                return None
+            last = res["d"].iloc[-1]
+            tags = sw["recent_tags"]
+            lt = f"{ss.TAG_INFO[tags[-1][1]][0]} {tags[-1][0]:%d/%m}" if tags else ""
+            return {"Mã": sym, "Giai đoạn": sw["stage"], "Tên giai đoạn": sw["stage_name"],
+                    "Điểm xả cạn (0–5)": sw["dry_score"], "Bối cảnh xấu": "Có" if sw["weak_ctx"] else "",
+                    "Mốc gần nhất": lt, "Cảnh báo bơm": sw["pump"]["level"] if sw["pump"]["ctx"] else 0,
+                    "Số cờ bơm": len(sw["pump"]["flags"]),
+                    "Giá": float(last["Close"]), "% 5 phiên": float((last["Close"] / res["d"]["Close"].iloc[-6] - 1) * 100),
+                    "GTGD TB20 (tỷ)": float(last["val_ma20"]) if not pd.isna(last["val_ma20"]) else 0.0}
+        except Exception:  # noqa: BLE001
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows = [r for r in ex.map(one, syms) if r]
+    return pd.DataFrame(rows)
+
+
 def _style(fig, style, h=320, title=None):
     fig.update_layout(height=h, template="plotly_dark", **style)
     if title:
@@ -144,6 +183,14 @@ def render_flow(symbol: str, chart_style: dict):
     if not sigs:
         st.info("Chưa có dấu hiệu dòng tiền nổi bật.")
 
+    sw = {}
+    try:
+        sw = ss.analyze_swing(d, intr, fr, pr, od, res.get("vp"))
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Không tính được thiết lập lướt sóng: {type(e).__name__}: {e}")
+    if sw:
+        _render_swing(sym, sw, d, res, chart_style)
+
     # ── Biểu đồ nến + volume gắn nhãn sự kiện ─────────────────────────────
     show = d.tail(120)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.68, 0.32], vertical_spacing=0.03)
@@ -163,6 +210,17 @@ def render_flow(symbol: str, chart_style: dict):
                                              line=dict(color="#fff", width=0.5)),
                                  hovertext=[f"{lab}<br>{r.ret:+.1f}% · vol x{r.vr:.1f}" for r in grp.itertuples()],
                                  hoverinfo="text"), row=1, col=1)
+    if sw:
+        tg = sw["xs"].tail(120)
+        tg = tg[tg["stage_tag"].apply(lambda t: isinstance(t, str))]
+        sym_map = {"dry": "circle-open", "test": "diamond", "sos": "star", "lps": "triangle-up-open", "fail": "x"}
+        for code, grp in tg.groupby("stage_tag"):
+            lab, clr = ss.TAG_INFO[code]
+            fig.add_trace(go.Scatter(x=grp["Date"], y=grp["Low"] * 0.965, mode="markers", name=lab,
+                                     marker=dict(symbol=sym_map.get(code, "circle"), size=13, color=clr,
+                                                 line=dict(color="#fff", width=1)),
+                                     hovertext=[f"{lab}<br>{r.Date:%d/%m/%Y} · {r.ret:+.1f}% · vol x{r.vr:.1f}" for r in grp.itertuples()],
+                                     hoverinfo="text"), row=1, col=1)
     vcol = []
     for r in show.itertuples():
         if r.event:
@@ -172,7 +230,7 @@ def render_flow(symbol: str, chart_style: dict):
     fig.add_trace(go.Bar(x=show["Date"], y=show["Volume"], marker_color=vcol, name="Volume", showlegend=False), row=2, col=1)
     fig.add_trace(go.Scatter(x=show["Date"], y=show["vol_ma20"], name="Vol TB20", line=dict(color=MUTED, width=1)), row=2, col=1)
     fig.update_layout(xaxis_rangeslider_visible=False)
-    st.plotly_chart(_style(fig, chart_style, 560, "120 phiên: tam giác xanh = phiên tích cực, đỏ = tiêu cực, vàng = cần theo dõi · cột vol tô màu theo loại phiên"),
+    st.plotly_chart(_style(fig, chart_style, 560, "120 phiên: tam giác = loại phiên · ◆ test cung · ★ cầu vào · ✖ thủng nền · cột vol tô màu theo loại phiên"),
                     use_container_width=True)
 
     st.markdown("#### 📅 Các phiên đáng chú ý (60 phiên gần nhất)")
@@ -303,6 +361,154 @@ def render_flow(symbol: str, chart_style: dict):
             st.markdown(f"- **{lab}** — {mean}")
         st.caption("Lưu ý: đây là đọc dấu vết dòng tiền từ dữ liệu công khai, không xác định được danh tính người mua/bán. "
                    "Dùng để đặt câu hỏi và xác nhận, không dùng một mình để ra quyết định.")
+
+    _render_swing_scanner()
+
+
+# ═════════════════════════════ THIẾT LẬP LƯỚT SÓNG ════════════════════════════
+def _stepper(sw):
+    done = [sw["sell_wave"], sw["stage"] >= 1, sw["stage"] >= 2, sw["stage"] >= 3, sw["stage"] >= 4]
+    names = ["Xả mạnh", "Xả cạn", "Test cung", "Cầu vào", "Giữ nhịp"]
+    cells = []
+    for i, (n, ok) in enumerate(zip(names, done)):
+        clr = GREEN if ok else "#2a4a6a"
+        cells.append(f"<div style='flex:1;text-align:center;padding:6px 2px;border-radius:6px;background:{clr}22;"
+                     f"border:1px solid {clr};color:{'#fff' if ok else '#6a8aaa'};font-size:12px;font-weight:{700 if ok else 400};'>"
+                     f"{'✔' if ok else i + 1} {n}</div>")
+    return "<div style='display:flex;gap:6px;margin:8px 0;'>" + "".join(cells) + "</div>"
+
+
+def _render_swing(sym, sw, d, res, chart_style):
+    st.markdown("#### 🎯 Thiết lập lướt sóng theo dòng tiền")
+    st.caption("Hai câu hỏi: (1) mã xấu đã XẢ CẠN chưa — bắt dần được chưa? (2) đợt tăng có BÊN MUA THẬT không hay đang bơm để xả?")
+    a, b = st.columns([3, 2])
+    with a:
+        stg = sw["stage"]
+        ctx = ("Bối cảnh phù hợp: mã đang xấu (dưới EMA50, đã giảm sâu) và đã có đợt xả có vol." if sw["weak_ctx"] and sw["sell_wave"]
+               else "Mã chưa ở bối cảnh 'bị xả mạnh rồi cạn' — thiết lập này chủ yếu dành cho mã đã giảm sâu." if not sw["weak_ctx"]
+               else "Mã đang xấu nhưng CHƯA thấy đợt xả có vol rõ ràng — nguồn cung chưa lộ diện hết.")
+        clr = GREEN if stg >= 3 else (CYAN if stg >= 1 else MUTED)
+        _card(f"<div style='font-size:12px;color:#6a9cc8;'>BẮT ĐÁY KHI XẢ CẠN · giai đoạn</div>"
+              f"<div style='font-size:20px;font-weight:800;color:{clr};'>{stg}/4 — {sw['stage_name'].upper()}</div>"
+              + _stepper(sw) +
+              f"<div style='font-size:12px;color:#cce0ff;'>{sw['stage_note']}</div>"
+              f"<div style='font-size:11px;color:#6a8aaa;margin-top:4px;'>{ctx}</div>", clr + "80")
+        st.markdown(f"**Điều kiện xả cạn — đạt {sw['dry_score']}/5** (cần ≥3 để vào giai đoạn 1)")
+        for ok, name, ev_ in sw["checklist"]:
+            st.markdown(f"{'✅' if ok else '⬜'} **{name}** — <span style='color:#8baed4;font-size:12px;'>{ev_}</span>",
+                        unsafe_allow_html=True)
+        if sw["recent_tags"]:
+            st.markdown("**Các mốc trong 30 phiên:** " + " → ".join(f"{ss.TAG_INFO[t][0]} ({dt:%d/%m})" for dt, t in sw["recent_tags"]))
+        if sw["confirms"] and stg >= 1:
+            st.success("Xác nhận cầu chủ động: " + " · ".join(sw["confirms"]))
+    with b:
+        pc = sw["pump"]
+        _card(f"<div style='font-size:12px;color:#6a9cc8;'>KIỂM TRA BƠM GIÁ · cầu có thật không?</div>"
+              f"<div style='font-size:14px;font-weight:700;color:{pc['color']};margin:4px 0;'>{pc['verdict']}</div>"
+              f"<div style='font-size:11px;color:#6a8aaa;'>{len(pc['flags'])} dấu hiệu cầu rỗng · {len(pc['positives'])} dấu hiệu cầu thật</div>",
+              pc["color"] + "80")
+        for t_, why in pc["flags"]:
+            st.markdown(_signal_html(-1, t_, why), unsafe_allow_html=True)
+        for t_, why in pc["positives"]:
+            st.markdown(_signal_html(+1, t_, why), unsafe_allow_html=True)
+
+    last = d.iloc[-1]
+    with st.expander("📋 Kế hoạch bắt dần 3 phần (tính theo rủi ro)", expanded=sw["stage"] >= 2):
+        k = st.columns(3)
+        cap = k[0].number_input("Vốn (triệu đ)", min_value=1.0, value=100.0, step=10.0, key="sw_cap") * 1e6
+        rp = k[1].number_input("Tổng rủi ro cho thiết lập (% vốn)", 0.1, 3.0, 0.5, 0.1, key="sw_rp",
+                               help="Mã xấu → nên bằng một nửa lệnh thường. 0.5% vốn = mất tối đa 500 nghìn với vốn 100 triệu nếu sai.")
+        mw = k[2].number_input("Tỷ trọng tối đa cả 3 phần (% vốn)", 5.0, 50.0, 20.0, 5.0, key="sw_mw")
+        vp = res.get("vp") or {}
+        pl = ss.plan_tranches(sw["state"], float(last["Close"]), float(last["atr"]) if not pd.isna(last["atr"]) else None,
+                              cap, rp, float(last["vwap20"]) if not pd.isna(last["vwap20"]) else None,
+                              float(last["ema50"]) if not pd.isna(last["ema50"]) else None, vp.get("poc"), mw)
+        if pl:
+            tb = pd.DataFrame(pl["rows"]).rename(columns={"Phan": "Phần", "Khi": "Mua khi", "Gia": "Giá mua (dự kiến)",
+                                                           "CatLo": "Cắt lỗ", "KL": "Khối lượng", "RuiRo": "Mất nếu sai (đ)",
+                                                           "TrangThai": "Trạng thái"})
+            st.dataframe(tb.style.format({"Giá mua (dự kiến)": "{:,.0f}", "Cắt lỗ": "{:,.0f}", "Khối lượng": "{:,}",
+                                          "Mất nếu sai (đ)": "{:,.0f}"}), use_container_width=True, hide_index=True)
+            st.markdown(f"**Mục tiêu:** TP1 {pl['tp1']:,.0f} · TP2 {pl['tp2']:,.0f} (VWAP20 / EMA50 / POC phía trên — nơi người kẹt hàng chờ bán) · "
+                        f"**R:R ước tính** ≈ 1 : {pl['rr']:.1f} · **Ngân sách rủi ro** {pl['budget']:,.0f} đ")
+            st.caption("Quy tắc: (1) chỉ mua phần kế tiếp khi bước trước đã xác nhận; (2) đóng cửa thủng đáy test kèm vol "
+                       "→ bán HẾT, không bình quân giá; (3) 15 phiên chưa tới TP1 → thoát, đây là lệnh lướt hồi chứ không phải đầu tư; "
+                       "(4) hàng về sau T+2.5 — mã yếu hay bị đạp đúng phiên hàng về; (5) mã nền tảng xấu: chốt phần lớn ở TP1.")
+
+    with st.expander(f"📜 Các tín hiệu này từng hiệu quả trên {sym} không?"):
+        st.caption("Đo lại trên lịch sử chính mã này: mua giá mở cửa phiên sau tín hiệu, xem lãi/lỗ sau 5/10/20 phiên (đã trừ phí 0.4%). "
+                   "Bấm nút để tải 4 năm dữ liệu — mẫu ít (<5 lần) thì chỉ để tham khảo.")
+        if st.button("🔬 Kiểm chứng trên 4 năm lịch sử", key="sw_hist_btn"):
+            long_px = _hist(sym, 1460)
+            if long_px is None or len(long_px) < 200:
+                st.info("Không đủ dữ liệu lịch sử dài.")
+            else:
+                lr = fl.analyze_flow(long_px)
+                lsw = ss.analyze_swing(lr["d"])
+                st.session_state["sw_hist"] = (sym, lsw.get("history") if lsw else None, len(long_px))
+        hh = st.session_state.get("sw_hist")
+        if hh and hh[0] == sym and hh[1]:
+            st.caption(f"{hh[2]} phiên dữ liệu.")
+            names = {"test": "🧪 Sau phiên TEST CUNG", "sos": "⭐ Sau phiên CẦU VÀO", "pump": "🎭 Sau CẢNH BÁO BƠM (≥4 cờ)"}
+            cols = st.columns(3)
+            for col, key in zip(cols, ("test", "sos", "pump")):
+                s_ = hh[1][key]["stats"]
+                if not s_.get("n"):
+                    col.markdown(_kpi(names[key], "Chưa từng xuất hiện", ""), unsafe_allow_html=True)
+                    continue
+                good = (s_["avg"] > 0) if key != "pump" else (s_["avg"] < 0)
+                col.markdown(_kpi(names[key], f"{s_['n']} lần · TB 10 phiên {s_['avg']:+.1f}%",
+                                  f"Thắng {s_['win']:.0f}% · trung vị {s_['med']:+.1f}% · sụt sâu TB {s_['mae']:.1f}%",
+                                  GREEN if good else RED), unsafe_allow_html=True)
+            for key in ("test", "sos", "pump"):
+                tb = hh[1][key]["table"]
+                if not tb.empty:
+                    st.markdown(f"**{names[key]}**")
+                    tb = tb.copy(); tb["Ngày"] = pd.to_datetime(tb["Ngày"]).dt.strftime("%d/%m/%Y")
+                    st.dataframe(tb.style.format({"Giá vào": "{:,.0f}", "5p": "{:+.1f}%", "10p": "{:+.1f}%", "20p": "{:+.1f}%",
+                                                  "Sụt sâu nhất 10p": "{:+.1f}%"}, na_rep="—"),
+                                 use_container_width=True, hide_index=True)
+            st.caption("Với cảnh báo bơm, kết quả ÂM nghĩa là cảnh báo đúng (giá giảm sau đó).")
+
+
+def _render_swing_scanner():
+    st.markdown("---")
+    st.markdown("#### 🔎 Quét nhóm mã: ai đang xả cạn, ai đang bị bơm rỗng")
+    c = st.columns([2, 1, 1])
+    grp = c[0].selectbox("Nhóm mã", ["VN30", "VN100", "HOSE", "HNX", "UPCOM"], index=1, key="sw_grp",
+                         help="HOSE/HNX/UPCOM: lấy 120 mã có giá trị giao dịch hôm nay lớn nhất")
+    min_val = c[1].number_input("GTGD TB20 tối thiểu (tỷ)", 0.0, 500.0, 1.0, 1.0, key="sw_minval")
+    go_ = c[2].button("🔎 Quét", key="sw_scan_btn", use_container_width=True)
+    if go_:
+        with st.spinner("Đang tải và phân tích từng mã (1–2 phút)..."):
+            st.session_state["sw_scan"] = (grp, _scan_swing(grp))
+    sc = st.session_state.get("sw_scan")
+    if not sc:
+        st.caption("Chọn nhóm và bấm Quét. Kết quả lưu 15 phút.")
+        return
+    g, df = sc
+    if df is None or df.empty:
+        st.info("Không quét được mã nào (nguồn dữ liệu lỗi).")
+        return
+    df = df[df["GTGD TB20 (tỷ)"] >= min_val]
+    st.caption(f"Nhóm {g}: {len(df)} mã đạt thanh khoản ≥ {min_val:.0f} tỷ/phiên.")
+    fmt = {"Giá": "{:,.0f}", "% 5 phiên": "{:+.1f}%", "GTGD TB20 (tỷ)": "{:,.1f}"}
+    cand = df[df["Giai đoạn"] >= 2].sort_values(["Giai đoạn", "Điểm xả cạn (0–5)"], ascending=False)
+    watch = df[df["Giai đoạn"] == 1].sort_values("Điểm xả cạn (0–5)", ascending=False)
+    pump = df[df["Cảnh báo bơm"] >= 2].sort_values(["Cảnh báo bơm", "Số cờ bơm"], ascending=False)
+    st.markdown(f"**🟢 Ứng viên bắt dần (đã test cung / cầu vào / giữ nhịp): {len(cand)} mã**")
+    if cand.empty:
+        st.caption("Không có mã nào.")
+    else:
+        st.dataframe(cand.style.format(fmt), use_container_width=True, hide_index=True)
+    st.markdown(f"**🔵 Đang xả cạn — theo dõi, chưa mua: {len(watch)} mã**")
+    if not watch.empty:
+        st.dataframe(watch.style.format(fmt), use_container_width=True, hide_index=True)
+    st.markdown(f"**🔴 Tăng nóng nhưng cầu yếu/rỗng — không mua đuổi: {len(pump)} mã**")
+    if not pump.empty:
+        st.dataframe(pump.style.format(fmt), use_container_width=True, hide_index=True)
+    st.caption("Bấm vào mã ở sidebar để xem chi tiết. Cột 'Cảnh báo bơm': 2 = cầu yếu, 3 = bơm thiếu cầu thật. "
+               "Quét chỉ dùng dữ liệu giá/khối lượng; dữ liệu khối ngoại, tự doanh, trong phiên chỉ có khi xem từng mã.")
 
 
 # ═════════════════════════════ TAB 🇻🇳 THỊ TRƯỜNG VN ══════════════════════════
